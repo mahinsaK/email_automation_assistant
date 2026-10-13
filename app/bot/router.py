@@ -17,10 +17,19 @@ from telegram.ext import (
 )
 
 from app.bot.access import owner_only
+from app.bot.handlers.ai_configuration_handler import (
+    build_ai_configuration_callbacks,
+)
 from app.bot.handlers.common_handler import cancel, help_command, start, unknown_command
 from app.bot.handlers.general_email_handler import build_general_email_callbacks
 from app.bot.keyboards import (
     ACTION_PATTERN,
+    AI_CONFIG_CALLBACK_PATTERN,
+    AI_CONFIG_PROVIDER_PATTERN,
+    AI_CONFIG_REPLACE_PATTERN,
+    AI_CONFIG_RETRY_PATTERN,
+    AI_REMOVE_PATTERN,
+    AI_REMOVE_CALLBACK_PATTERN,
     AI_UNAVAILABLE_PATTERN,
     DRAFT_METHOD_PATTERN,
     EDIT_PATTERN,
@@ -29,10 +38,20 @@ from app.bot.keyboards import (
 )
 from app.bot.states import GeneralEmailState
 from app.config import Settings
+from app.models.ai_configuration import AIProviderType
+from app.repositories.ai_configuration import (
+    AIConfigurationRepositoryError,
+    SQLiteAIConfigurationRepository,
+)
+from app.services.ai.credential_validator import OpenAICredentialValidator
 from app.services.ai.openai_provider import OpenAIProvider
+from app.services.ai.provider_factory import AIProviderFactory
+from app.services.ai_configuration import UserAIConfigurationService
 from app.services.ai_email_generator import AIEmailGenerator
+from app.services.credential_cipher import CredentialCipherError, FernetCredentialCipher
 from app.services.email_generator import DeterministicEmailGenerator, EmailGenerator
 from app.services.email_sender import MockEmailSender
+from app.services.user_email_generator import ConfiguredUserEmailGeneratorResolver
 from app.workflows.general_email import GeneralEmailWorkflow
 
 
@@ -69,16 +88,68 @@ async def handle_error(update: object, context: object) -> None:
 def build_application(settings: Settings) -> Application:
     """Wire concrete dependencies and return the configured Telegram app."""
 
+    repository = SQLiteAIConfigurationRepository(settings.database_path)
+    cipher = None
+    if settings.credential_encryption_key:
+        try:
+            cipher = FernetCredentialCipher(settings.credential_encryption_key)
+        except CredentialCipherError:
+            LOGGER.error(
+                "Credential encryption is unavailable because its key is invalid"
+            )
+    else:
+        LOGGER.warning(
+            "Credential encryption key missing; per-user AI configuration disabled"
+        )
+
+    configuration_service = UserAIConfigurationService(
+        repository=repository,
+        cipher=cipher,
+        validators={
+            AIProviderType.OPENAI: OpenAICredentialValidator(
+                timeout_seconds=settings.ai_timeout_seconds,
+            )
+        },
+    )
+    application_generator = build_email_generator(settings)
+    generator_resolver = ConfiguredUserEmailGeneratorResolver(
+        configuration_service=configuration_service,
+        provider_factory=AIProviderFactory(
+            model=settings.ai_model,
+            timeout_seconds=settings.ai_timeout_seconds,
+        ),
+        application_generator=application_generator,
+    )
     workflow = GeneralEmailWorkflow(
-        generator=build_email_generator(settings),
+        generator=None,
         sender=MockEmailSender(),
     )
-    callbacks = build_general_email_callbacks(workflow)
+    ai_callbacks = build_ai_configuration_callbacks(
+        configuration_service,
+        application_ai_available=application_generator is not None,
+    )
+    callbacks = build_general_email_callbacks(
+        workflow,
+        generator_resolver=generator_resolver,
+        start_ai_configuration=ai_callbacks.begin_from_email,
+    )
     protect = owner_only(settings.allowed_telegram_user_id)
 
-    application = Application.builder().token(settings.telegram_bot_token).build()
+    async def initialize_services(application: Application) -> None:
+        try:
+            await repository.initialize()
+        except AIConfigurationRepositoryError:
+            LOGGER.error("AI configuration database initialization failed")
+
+    application = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .post_init(initialize_services)
+        .build()
+    )
     application.add_handler(CommandHandler("start", protect(start)))
     application.add_handler(CommandHandler("help", protect(help_command)))
+    application.add_handler(CommandHandler("ai_status", protect(ai_callbacks.status)))
     # This conversation intentionally spans multiple text and callback messages,
     # so it must be keyed per user/chat rather than per Telegram message. PTB emits
     # a generic warning for that valid mixed-handler design; suppress only that
@@ -90,7 +161,11 @@ def build_application(settings: Settings) -> Application:
             category=PTBUserWarning,
         )
         conversation_handler = ConversationHandler(
-            entry_points=[CommandHandler("send", protect(callbacks.begin))],
+            entry_points=[
+                CommandHandler("send", protect(callbacks.begin)),
+                CommandHandler("configure_ai", protect(ai_callbacks.begin)),
+                CommandHandler("remove_ai", protect(ai_callbacks.begin_remove)),
+            ],
             states={
                 GeneralEmailState.WAITING_RECIPIENT: [
                     MessageHandler(
@@ -176,9 +251,47 @@ def build_application(settings: Settings) -> Application:
                         protect(callbacks.receive_edited_context),
                     )
                 ],
+                GeneralEmailState.AI_CONFIG_REPLACE_CONFIRM: [
+                    CallbackQueryHandler(
+                        protect(ai_callbacks.handle_replace),
+                        pattern=AI_CONFIG_REPLACE_PATTERN,
+                    )
+                ],
+                GeneralEmailState.AI_CONFIG_PROVIDER: [
+                    CallbackQueryHandler(
+                        protect(ai_callbacks.handle_provider),
+                        pattern=AI_CONFIG_PROVIDER_PATTERN,
+                    )
+                ],
+                GeneralEmailState.AI_CONFIG_API_KEY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(ai_callbacks.receive_api_key),
+                    )
+                ],
+                GeneralEmailState.AI_CONFIG_RETRY: [
+                    CallbackQueryHandler(
+                        protect(ai_callbacks.handle_retry),
+                        pattern=AI_CONFIG_RETRY_PATTERN,
+                    )
+                ],
+                GeneralEmailState.AI_REMOVE_CONFIRM: [
+                    CallbackQueryHandler(
+                        protect(ai_callbacks.handle_remove),
+                        pattern=AI_REMOVE_PATTERN,
+                    )
+                ],
             },
             fallbacks=[
                 CommandHandler("cancel", protect(cancel)),
+                CallbackQueryHandler(
+                    protect(ai_callbacks.handle_invalid_callback),
+                    pattern=AI_CONFIG_CALLBACK_PATTERN,
+                ),
+                CallbackQueryHandler(
+                    protect(ai_callbacks.handle_invalid_callback),
+                    pattern=AI_REMOVE_CALLBACK_PATTERN,
+                ),
                 CallbackQueryHandler(
                     protect(callbacks.handle_invalid_callback),
                     pattern=EMAIL_CALLBACK_PATTERN,
@@ -188,6 +301,18 @@ def build_application(settings: Settings) -> Application:
         )
     application.add_handler(conversation_handler)
     application.add_handler(CommandHandler("cancel", protect(cancel)))
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(ai_callbacks.handle_invalid_callback),
+            pattern=AI_CONFIG_CALLBACK_PATTERN,
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(ai_callbacks.handle_invalid_callback),
+            pattern=AI_REMOVE_CALLBACK_PATTERN,
+        )
+    )
     application.add_handler(MessageHandler(filters.COMMAND, protect(unknown_command)))
     application.add_handler(
         CallbackQueryHandler(

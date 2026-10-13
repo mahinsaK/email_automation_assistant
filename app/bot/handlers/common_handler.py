@@ -22,6 +22,9 @@ HELP_TEXT = (
     "/start - Show the welcome message\n"
     "/help - Show this help\n"
     "/send - Create a general email draft\n"
+    "/configure_ai - Configure or replace your AI provider credential\n"
+    "/ai_status - Show your AI configuration status\n"
+    "/remove_ai - Remove your saved AI configuration\n"
     "/cancel - Cancel the active workflow"
 )
 
@@ -44,6 +47,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Clear temporary state and end the current conversation."""
 
     context.user_data.pop("general_email", None)
+    context.user_data.pop("ai_configuration", None)
     LOGGER.info("Email workflow cancelled")
     if update.effective_message:
         await update.effective_message.reply_text(

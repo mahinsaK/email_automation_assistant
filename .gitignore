@@ -6,6 +6,9 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
 .idea/
 .vscode/
 .DS_Store

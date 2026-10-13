@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 
 DEFAULT_AI_MODEL = "gpt-4o-mini"
+DEFAULT_DATABASE_PATH = "data/email_assistant.db"
 SUPPORTED_AI_PROVIDERS = {"openai", "deterministic"}
 
 
@@ -27,6 +28,8 @@ class Settings:
     openai_api_key: str | None = None
     ai_model: str = DEFAULT_AI_MODEL
     ai_timeout_seconds: float = 30.0
+    credential_encryption_key: str | None = None
+    database_path: str = DEFAULT_DATABASE_PATH
 
     @property
     def ai_enabled(self) -> bool:
@@ -63,6 +66,13 @@ class Settings:
 
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
         ai_model = os.getenv("AI_MODEL", DEFAULT_AI_MODEL).strip() or DEFAULT_AI_MODEL
+        credential_encryption_key = (
+            os.getenv("CREDENTIAL_ENCRYPTION_KEY", "").strip() or None
+        )
+        database_path = (
+            os.getenv("DATABASE_PATH", DEFAULT_DATABASE_PATH).strip()
+            or DEFAULT_DATABASE_PATH
+        )
         timeout_value = os.getenv("AI_TIMEOUT_SECONDS", "30").strip()
         try:
             ai_timeout_seconds = float(timeout_value)
@@ -81,5 +91,7 @@ class Settings:
             openai_api_key=openai_api_key,
             ai_model=ai_model,
             ai_timeout_seconds=ai_timeout_seconds,
+            credential_encryption_key=credential_encryption_key,
+            database_path=database_path,
         )
 

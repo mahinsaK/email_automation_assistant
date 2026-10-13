@@ -87,17 +87,27 @@ class GeneralEmailWorkflow:
 
         return self._generator is not None
 
-    async def create_draft(self, request: GeneralEmailRequest) -> EmailDraft:
+    async def create_draft(
+        self,
+        request: GeneralEmailRequest,
+        *,
+        generator: EmailGenerator | None = None,
+    ) -> EmailDraft:
         """Validate a request and generate a draft (kept for the Phase 1 API)."""
 
         validated_request = self._validate_request(request)
-        return await self._generate(validated_request)
+        return await self._generate(validated_request, generator=generator)
 
-    async def start(self, request: GeneralEmailRequest) -> GeneralEmailSession:
+    async def start(
+        self,
+        request: GeneralEmailRequest,
+        *,
+        generator: EmailGenerator | None = None,
+    ) -> GeneralEmailSession:
         """Start an AI draft approval lifecycle."""
 
         validated_request = self._validate_request(request)
-        draft = await self._generate(validated_request)
+        draft = await self._generate(validated_request, generator=generator)
         LOGGER.info("AI draft generated")
         return GeneralEmailSession(
             request=validated_request,
@@ -138,12 +148,14 @@ class GeneralEmailWorkflow:
     async def regenerate(
         self,
         session: GeneralEmailSession,
+        *,
+        generator: EmailGenerator | None = None,
     ) -> GeneralEmailSession:
         """Generate a fresh draft from the stored original request."""
 
         self._require_editable(session)
         request = self._require_ai_request(session)
-        draft = await self._generate(request)
+        draft = await self._generate(request, generator=generator)
         LOGGER.info("Email draft regenerated")
         return replace(session, draft=draft)
 
@@ -201,6 +213,8 @@ class GeneralEmailWorkflow:
         self,
         session: GeneralEmailSession,
         context: str,
+        *,
+        generator: EmailGenerator | None = None,
     ) -> GeneralEmailSession:
         """Update source context and intentionally regenerate the entire draft."""
 
@@ -212,7 +226,7 @@ class GeneralEmailWorkflow:
             max_length=MAX_CONTEXT_LENGTH,
         )
         request = replace(current_request, context=validated)
-        draft = await self._generate(request)
+        draft = await self._generate(request, generator=generator)
         LOGGER.info("Original context edited and email draft regenerated")
         return replace(session, request=request, draft=draft)
 
@@ -265,10 +279,16 @@ class GeneralEmailWorkflow:
 
         LOGGER.info("Email workflow cancelled")
 
-    async def _generate(self, request: GeneralEmailRequest) -> EmailDraft:
-        if self._generator is None:
+    async def _generate(
+        self,
+        request: GeneralEmailRequest,
+        *,
+        generator: EmailGenerator | None = None,
+    ) -> EmailDraft:
+        selected_generator = generator or self._generator
+        if selected_generator is None:
             raise AIUnavailableError("AI email generation is not configured.")
-        draft = await self._generator.generate(
+        draft = await selected_generator.generate(
             recipient=request.recipient,
             purpose=request.purpose,
             context=request.context,

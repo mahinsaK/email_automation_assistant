@@ -42,6 +42,9 @@ from app.services.validation import (
     validate_email,
     validate_text,
 )
+from app.services.email_generator import EmailGenerator
+from app.services.ai_configuration import AIConfigurationError
+from app.services.user_email_generator import UserEmailGeneratorResolver
 from app.workflows.general_email import (
     DraftMode,
     GeneralEmailRequest,
@@ -122,10 +125,34 @@ async def _show_stale(message: Message | None) -> int:
 
 def build_general_email_callbacks(
     workflow: GeneralEmailWorkflow,
+    *,
+    generator_resolver: UserEmailGeneratorResolver | None = None,
+    start_ai_configuration: Callback | None = None,
 ) -> GeneralEmailCallbacks:
     """Create Telegram callbacks with application workflow dependencies injected."""
 
+    async def _ai_available(update: Update) -> bool:
+        if generator_resolver is None:
+            return workflow.ai_available
+        user = update.effective_user
+        if user is None:
+            return False
+        try:
+            return await generator_resolver.is_available(user.id)
+        except Exception:
+            LOGGER.exception("User AI availability lookup failed")
+            return False
+
+    async def _resolve_generator(update: Update) -> EmailGenerator | None:
+        if generator_resolver is None:
+            return None
+        user = update.effective_user
+        if user is None:
+            return None
+        return await generator_resolver.resolve(user.id)
+
     async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data.pop("ai_configuration", None)
         context.user_data[WORKFLOW_KEY] = {}
         LOGGER.info("General email workflow started")
         if update.effective_message:
@@ -181,7 +208,7 @@ def build_general_email_callbacks(
             data["draft_mode"] = DraftMode.AI
             LOGGER.info("AI draft mode selected")
             await query.edit_message_reply_markup(reply_markup=None)
-            if workflow.ai_available:
+            if await _ai_available(update):
                 await query.message.reply_text(
                     "What is the purpose of the email?\n"
                     "For example: meeting request, introduction, or follow-up."
@@ -190,7 +217,7 @@ def build_general_email_callbacks(
 
             LOGGER.info("AI generation unavailable")
             await query.message.reply_text(
-                "🤖 AI generation is not configured for this environment.\n\n"
+                "🤖 AI generation is not configured for your account.\n\n"
                 "You can still create and approve emails manually.",
                 reply_markup=ai_unavailable_keyboard(),
             )
@@ -216,6 +243,8 @@ def build_general_email_callbacks(
             return await _show_stale(query.message)
 
         if query.data == AI_CONFIGURE:
+            if start_ai_configuration is not None:
+                return await start_ai_configuration(update, context)
             await query.message.reply_text(
                 "AI configuration through Telegram is not available yet. "
                 "Configure the server environment or enter the draft manually."
@@ -376,16 +405,32 @@ def build_general_email_callbacks(
             return await _show_stale(query.message)
 
         try:
+            generator = await _resolve_generator(update)
+            if generator_resolver is not None and generator is None:
+                await query.message.reply_text(
+                    "🤖 AI generation is no longer configured.\n\n"
+                    "Choose Configure AI or enter the draft manually.",
+                    reply_markup=ai_unavailable_keyboard(),
+                )
+                return GeneralEmailState.WAITING_AI_UNAVAILABLE_ACTION
             request = GeneralEmailRequest(
                 recipient=str(data["recipient"]),
                 purpose=str(data["purpose"]),
                 context=str(data["context"]),
                 tone=tone,
             )
-            session = await workflow.start(request)
+            session = await workflow.start(request, generator=generator)
         except (KeyError, TypeError):
             context.user_data.pop(WORKFLOW_KEY, None)
             return await _show_stale(query.message)
+        except AIConfigurationError:
+            LOGGER.warning("User AI configuration could not be resolved")
+            await query.message.reply_text(
+                "⚠️ Your AI configuration is unavailable right now.\n\n"
+                "You can configure AI again or enter the draft manually.",
+                reply_markup=ai_unavailable_keyboard(),
+            )
+            return GeneralEmailState.WAITING_AI_UNAVAILABLE_ACTION
         except Exception:
             LOGGER.exception("Email draft generation failed")
             context.user_data.pop(WORKFLOW_KEY, None)
@@ -451,7 +496,16 @@ def build_general_email_callbacks(
                 )
                 return GeneralEmailState.WAITING_FOR_ACTION
             try:
-                regenerated = await workflow.regenerate(session)
+                generator = await _resolve_generator(update)
+                if generator_resolver is not None and generator is None:
+                    await query.message.reply_text(
+                        "AI generation is no longer configured. Your draft is unchanged."
+                    )
+                    return GeneralEmailState.WAITING_FOR_ACTION
+                regenerated = await workflow.regenerate(
+                    session,
+                    generator=generator,
+                )
             except Exception:
                 LOGGER.exception("Email draft regeneration failed")
                 await query.message.reply_text(
@@ -600,9 +654,17 @@ def build_general_email_callbacks(
         if not session:
             return await _show_stale(message)
         try:
+            generator = await _resolve_generator(update)
+            if generator_resolver is not None and generator is None:
+                if message:
+                    await message.reply_text(
+                        "AI generation is no longer configured. Your draft is unchanged."
+                    )
+                return GeneralEmailState.EDIT_CONTEXT
             updated = await workflow.edit_context(
                 session,
                 message.text if message else "",
+                generator=generator,
             )
         except InputValidationError as error:
             if message:
