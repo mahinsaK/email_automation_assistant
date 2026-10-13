@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 
+DEFAULT_AI_MODEL = "gpt-4o-mini"
+SUPPORTED_AI_PROVIDERS = {"openai", "deterministic"}
+
+
 class ConfigurationError(RuntimeError):
     """Raised when required application configuration is missing or invalid."""
 
@@ -19,6 +23,10 @@ class Settings:
     telegram_bot_token: str
     allowed_telegram_user_id: int | None = None
     log_level: str = "INFO"
+    ai_provider: str = "openai"
+    openai_api_key: str | None = None
+    ai_model: str = DEFAULT_AI_MODEL
+    ai_timeout_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -42,9 +50,30 @@ class Settings:
                 ) from error
 
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+        ai_provider = os.getenv("AI_PROVIDER", "openai").strip().lower() or "openai"
+        if ai_provider not in SUPPORTED_AI_PROVIDERS:
+            choices = ", ".join(sorted(SUPPORTED_AI_PROVIDERS))
+            raise ConfigurationError(f"AI_PROVIDER must be one of: {choices}.")
+
+        openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
+        ai_model = os.getenv("AI_MODEL", DEFAULT_AI_MODEL).strip() or DEFAULT_AI_MODEL
+        timeout_value = os.getenv("AI_TIMEOUT_SECONDS", "30").strip()
+        try:
+            ai_timeout_seconds = float(timeout_value)
+        except ValueError as error:
+            raise ConfigurationError("AI_TIMEOUT_SECONDS must be a number.") from error
+        if not 1 <= ai_timeout_seconds <= 120:
+            raise ConfigurationError(
+                "AI_TIMEOUT_SECONDS must be between 1 and 120 seconds."
+            )
+
         return cls(
             telegram_bot_token=token,
             allowed_telegram_user_id=allowed_id,
             log_level=log_level,
+            ai_provider=ai_provider,
+            openai_api_key=openai_api_key,
+            ai_model=ai_model,
+            ai_timeout_seconds=ai_timeout_seconds,
         )
 

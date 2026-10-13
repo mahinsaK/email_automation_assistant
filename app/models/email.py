@@ -16,6 +16,15 @@ class EmailStatus(StrEnum):
     SENT = "sent"
 
 
+class EmailTone(StrEnum):
+    """Supported drafting tones shared by all generator strategies."""
+
+    PROFESSIONAL = "Professional"
+    CONCISE = "Concise"
+    FRIENDLY = "Friendly"
+    FORMAL = "Formal"
+
+
 @dataclass(frozen=True, slots=True)
 class SendResult:
     """Provider-independent result returned by an email sender."""

@@ -1,8 +1,10 @@
 # AI Email Automation Assistant
 
 An extensible, human-in-the-loop email automation system with Telegram as its
-first interface. Phase 2 creates deterministic email drafts, lets the user edit
-or regenerate them, and requires explicit approval before a simulated send.
+first interface. Phase 3 optionally creates validated AI-backed email drafts,
+lets the user edit or regenerate them, and requires explicit approval before a
+simulated send. Without an AI key it remains fully usable offline with the
+deterministic generator.
 
 No real email is delivered in this phase.
 
@@ -27,6 +29,8 @@ WAITING_RECIPIENT
 WAITING_PURPOSE
   ↓
 WAITING_CONTEXT
+  ↓
+WAITING_TONE
   ↓
 GENERATE
   ↓
@@ -67,9 +71,10 @@ The preview has four inline actions:
 - **Regenerate** — calls the generator again with the stored request data.
 - **Cancel** — discards temporary state without calling the sender.
 
-The Phase 2 generator is deterministic, so regeneration with unchanged input can
-produce the same draft. That is intentional: this phase establishes the workflow
-contract. A later AI strategy may produce variations.
+With AI enabled, regeneration calls the provider again with the stored recipient,
+purpose, context, and tone, so the result may differ. Offline regeneration uses
+the deterministic fallback and may produce the same draft. Approval semantics are
+identical in both modes.
 
 Recipient edits update both the source request and current draft but preserve the
 subject and body. Subject and body edits affect only generated content. Context
@@ -85,9 +90,13 @@ Telegram
 Handler + explicit conversation states
    ↓
 GeneralEmailWorkflow
-   ├── EmailGenerator protocol
-   │      ↓
-   │  DeterministicEmailGenerator
+   ├── EmailGenerator protocol (strategy)
+   │      ├── DeterministicEmailGenerator
+   │      └── AIEmailGenerator
+   │              ↓
+   │          LLMProvider protocol
+   │              ↓
+   │          OpenAIProvider
    │
    └── EmailSender protocol
           ↓
@@ -102,7 +111,10 @@ app/
 │   ├── router.py           # State-machine and dependency composition
 │   └── states.py           # Explicit conversation states
 ├── models/                 # Provider-independent immutable domain values
-├── services/               # Generator/sender ports and concrete Phase 2 strategies
+├── prompts/                # Provider-independent prompt construction
+├── services/
+│   ├── ai/                 # LLM port, Pydantic boundary, OpenAI adapter
+│   └── ...                 # Generator/sender ports and concrete strategies
 ├── workflows/              # Telegram-independent application behavior
 ├── config.py               # Environment configuration
 └── logging_config.py       # Safe logging setup
@@ -112,12 +124,25 @@ main.py                     # Executable entry point
 
 ### Engineering decisions
 
-- **Strategy and dependency inversion:** `GeneralEmailWorkflow` depends on the
-  `EmailGenerator` and `EmailSender` protocols. A later AI generator or Gmail
-  sender can implement these ports without changing approval logic.
+- **Strategy and dependency inversion:** `GeneralEmailWorkflow` still depends on
+  `EmailGenerator` and `EmailSender`, never OpenAI. AI and deterministic
+  generators are interchangeable strategies.
 - **Dependency injection:** `build_application` is the composition root. It wires
-  `DeterministicEmailGenerator` and `MockEmailSender` into the workflow, then
-  injects that workflow into Telegram callbacks.
+  the configured generator and `MockEmailSender` into the workflow, then injects
+  that workflow into Telegram callbacks.
+- **Adapter pattern:** `OpenAIProvider` translates the external asynchronous
+  Responses API into the internal `LLMProvider` interface.
+- **Boundary validation:** untrusted provider output must pass the strict
+  `AIEmailOutput` Pydantic model before it can become an `EmailDraft`.
+- **Structured output:** subject and body arrive as a schema-constrained object,
+  avoiding fragile attempts to split arbitrary prose. The application validates
+  the result again because other provider adapters may not enforce schemas.
+- **Fallback strategy:** expected provider and response-validation failures use
+  deterministic generation. Unexpected programming errors propagate instead of
+  being silently hidden.
+- **Prompt separation:** stable system rules prohibit invented facts and treat a
+  JSON-encoded request as untrusted data. User context cannot become application
+  or system instructions merely by appearing in the prompt.
 - **State machine:** input, approval, menu, and field-edit behavior use explicit
   enum states instead of combinations of boolean flags.
 - **Immutability:** `EmailDraft`, request, and session snapshots are frozen
@@ -148,6 +173,26 @@ delivery provider in a later phase.
 Stale or unknown email callback data is answered safely. If workflow state has
 already been cleared, the user is told to start again with `/send`.
 
+## Phase 3 AI generation
+
+The provider boundary accepts separate system and user prompts plus a Pydantic
+response model. `OpenAIProvider` uses the asynchronous Responses API and
+Structured Outputs. This follows the official OpenAI guidance to use schema-based
+Structured Outputs rather than plain JSON mode when the model supports it:
+
+- [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses)
+- [OpenAI Python SDK](https://developers.openai.com/api/reference/python)
+
+`AIEmailGenerator` builds the prompt, calls `LLMProvider`, validates the returned
+JSON, and creates the provider-independent `EmailDraft`. It falls back only for:
+
+- provider authentication, rate-limit, timeout, connection, or API failures
+- missing, empty, malformed, oversized, or otherwise invalid structured output
+
+No prompt, API key, access token, or complete email context is written to logs.
+The provider timeout defaults to 30 seconds and the SDK performs at most one
+automatic retry.
+
 ## Setup and run
 
 Python 3.11 or newer is required.
@@ -160,7 +205,22 @@ cp .env.example .env
 ```
 
 Create a bot with Telegram's BotFather, place its token in `.env`, and optionally
-set `ALLOWED_TELEGRAM_USER_ID`. Then run:
+set `ALLOWED_TELEGRAM_USER_ID`.
+
+AI configuration is optional:
+
+```env
+AI_PROVIDER=openai
+OPENAI_API_KEY=
+AI_MODEL=gpt-4o-mini
+AI_TIMEOUT_SECONDS=30
+```
+
+- With an OpenAI key, the composition root injects `AIEmailGenerator`.
+- Without a key, it injects `DeterministicEmailGenerator`.
+- Set `AI_PROVIDER=deterministic` to force offline mode even when a key exists.
+
+Then run:
 
 ```bash
 python main.py
@@ -177,18 +237,20 @@ pytest
 
 Tests cover validation, deterministic generation, confirmation, cancellation,
 regeneration, every edit type, invalid edited recipients, sender failure and
-retry, duplicate confirmation, stale callbacks, and application composition.
-They do not contact Telegram, Gmail, or an AI provider.
+retry, duplicate confirmation, stale callbacks, tone selection, valid and invalid
+AI output, provider failure, fallback, optional configuration, prompt contents,
+and complete fake-provider composition. They do not contact Telegram, Gmail, or
+an AI provider.
 
 ## Why Gmail is absent
 
-Phase 2 proves the approval lifecycle before external delivery is introduced.
+Phase 3 preserves the proven approval lifecycle while adding generation only.
 This isolates state-machine, editing, idempotency, and failure-recovery bugs while
 all sends are harmless and deterministic. Gmail API and OAuth belong to Phase 5,
 after the AI and job-application workflows are stable.
 
 ## Current checkpoint
 
-Phase 2 is implemented. OpenAI, Gemini, Claude, Gmail, OAuth, attachments, job
-applications, databases, scheduling, and real delivery remain intentionally
-absent.
+Phase 3 is implemented with an optional OpenAI generation adapter. Gemini, Claude,
+Gmail, OAuth, attachments, job applications, databases, scheduling, and real
+delivery remain intentionally absent. `MockEmailSender` is still the only sender.

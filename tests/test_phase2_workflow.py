@@ -11,7 +11,7 @@ class RecordingGenerator:
     """Generator test double that exposes invocation count and input."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str]] = []
+        self.calls: list[tuple[str, str, str, str]] = []
 
     async def generate(
         self,
@@ -19,8 +19,9 @@ class RecordingGenerator:
         recipient: str,
         purpose: str,
         context: str,
+        tone: str = "Professional",
     ) -> EmailDraft:
-        self.calls.append((recipient, purpose, context))
+        self.calls.append((recipient, purpose, context, tone))
         number = len(self.calls)
         return EmailDraft(
             recipient=recipient,

@@ -14,13 +14,18 @@ from app.workflows.general_email import GeneralEmailRequest, GeneralEmailWorkflo
 
 
 class StaticGenerator:
+    def __init__(self) -> None:
+        self.tones: list[str] = []
+
     async def generate(
         self,
         *,
         recipient: str,
         purpose: str,
         context: str,
+        tone: str = "Professional",
     ) -> EmailDraft:
+        self.tones.append(tone)
         return EmailDraft(recipient=recipient, subject=purpose, body=context)
 
 
@@ -117,3 +122,27 @@ def test_stale_confirmation_is_handled_without_sender_call() -> None:
     assert sender.calls == 0
     update.callback_query.answer.assert_awaited_once()
     assert "no longer active" in update.callback_query.message.reply_text.await_args.args[0]
+
+
+def test_tone_selection_generates_preview_and_enters_action_state() -> None:
+    generator = StaticGenerator()
+    workflow = GeneralEmailWorkflow(generator, CountingSender())
+    callbacks = build_general_email_callbacks(workflow)
+    context = SimpleNamespace(
+        user_data={
+            "general_email": {
+                "recipient": "user@example.com",
+                "purpose": "A subject",
+                "context": "A body",
+            }
+        }
+    )
+    update = make_callback_update("email:tone:friendly")
+
+    state = asyncio.run(callbacks.handle_tone(update, context))
+
+    session = context.user_data["general_email"]["session"]
+    assert state is GeneralEmailState.WAITING_FOR_ACTION
+    assert session.request.tone.value == "Friendly"
+    assert generator.tones == ["Friendly"]
+    update.callback_query.answer.assert_awaited_once()

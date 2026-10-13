@@ -15,4 +15,5 @@ class GeneralEmailState(IntEnum):
     EDIT_SUBJECT = 7
     EDIT_BODY = 8
     EDIT_CONTEXT = 9
+    WAITING_TONE = 10
 

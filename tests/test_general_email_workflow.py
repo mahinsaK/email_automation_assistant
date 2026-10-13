@@ -54,6 +54,7 @@ class FakeGenerator:
         recipient: str,
         purpose: str,
         context: str,
+        tone: str = "Professional",
     ) -> EmailDraft:
         return EmailDraft(recipient=recipient, subject="Fake", body=context)
 

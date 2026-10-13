@@ -20,8 +20,10 @@ from app.bot.keyboards import (
     EDIT_RECIPIENT,
     EDIT_SUBJECT,
     REGENERATE,
+    TONE_CALLBACKS,
     edit_menu_keyboard,
     preview_actions_keyboard,
+    tone_keyboard,
 )
 from app.bot.states import GeneralEmailState
 from app.services.validation import InputValidationError, validate_email, validate_text
@@ -47,6 +49,7 @@ class GeneralEmailCallbacks:
     receive_recipient: Callback
     receive_purpose: Callback
     receive_context: Callback
+    handle_tone: Callback
     handle_action: Callback
     handle_edit_choice: Callback
     receive_edited_recipient: Callback
@@ -163,12 +166,7 @@ def build_general_email_callbacks(
                 max_length=4000,
             )
             data = context.user_data[WORKFLOW_KEY]
-            request = GeneralEmailRequest(
-                recipient=str(data["recipient"]),
-                purpose=str(data["purpose"]),
-                context=additional_context,
-            )
-            session = await workflow.start(request)
+            data["context"] = additional_context
         except InputValidationError as error:
             if message:
                 await message.reply_text(f"{error} Please enter it again.")
@@ -176,19 +174,59 @@ def build_general_email_callbacks(
         except (KeyError, TypeError):
             context.user_data.pop(WORKFLOW_KEY, None)
             return await _show_stale(message)
+
+        if message:
+            await message.reply_text(
+                "Choose the tone for this email:",
+                reply_markup=tone_keyboard(),
+            )
+        return GeneralEmailState.WAITING_TONE
+
+    async def handle_tone(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        query = update.callback_query
+        if not query:
+            return await _show_stale(update.effective_message)
+        await query.answer()
+        if not query.message:
+            return await _show_stale(None)
+
+        tone = TONE_CALLBACKS.get(query.data or "")
+        data = _workflow_data(context)
+        if tone is None:
+            LOGGER.warning("Invalid tone callback received")
+            await query.message.reply_text(
+                "That tone is not supported. Please use one of the current buttons."
+            )
+            return GeneralEmailState.WAITING_TONE
+        if data is None:
+            return await _show_stale(query.message)
+
+        try:
+            request = GeneralEmailRequest(
+                recipient=str(data["recipient"]),
+                purpose=str(data["purpose"]),
+                context=str(data["context"]),
+                tone=tone,
+            )
+            session = await workflow.start(request)
+        except (KeyError, TypeError):
+            context.user_data.pop(WORKFLOW_KEY, None)
+            return await _show_stale(query.message)
         except Exception:
             LOGGER.exception("Email draft generation failed")
             context.user_data.pop(WORKFLOW_KEY, None)
-            if message:
-                await message.reply_text(
-                    "I could not create the draft. Please try /send again."
-                )
+            await query.message.reply_text(
+                "I could not create the draft. Please try /send again."
+            )
             return ConversationHandler.END
 
+        await query.edit_message_reply_markup(reply_markup=None)
         _store_session(context, session)
         LOGGER.info("Email draft generated and previewed")
-        if message:
-            await _show_preview(message, session)
+        await _show_preview(query.message, session)
         return GeneralEmailState.WAITING_FOR_ACTION
 
     async def handle_action(
@@ -404,7 +442,7 @@ def build_general_email_callbacks(
         query = update.callback_query
         if query:
             await query.answer()
-        if not _active_session(context):
+        if _workflow_data(context) is None:
             return await _show_stale(query.message if query else update.effective_message)
         LOGGER.warning("Invalid callback received for active email workflow")
         if query and query.message:
@@ -418,6 +456,7 @@ def build_general_email_callbacks(
         receive_recipient=receive_recipient,
         receive_purpose=receive_purpose,
         receive_context=receive_context,
+        handle_tone=handle_tone,
         handle_action=handle_action,
         handle_edit_choice=handle_edit_choice,
         receive_edited_recipient=receive_edited_recipient,

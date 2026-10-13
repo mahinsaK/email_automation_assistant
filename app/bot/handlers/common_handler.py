@@ -12,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 WELCOME_TEXT = (
     "Welcome to AI Email Automation Assistant.\n\n"
     "I can help you create, edit, and approve a professional email draft. "
-    "Email delivery is simulated during Phase 2; no real email is sent.\n\n"
+    "Email delivery is still simulated; no real email is sent.\n\n"
     "Use /send to create a draft or /help to see available commands."
 )
 

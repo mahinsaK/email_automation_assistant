@@ -6,10 +6,18 @@ import logging
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
-from app.models.email import EmailDraft, EmailStatus, SendResult
+from app.models.email import EmailDraft, EmailStatus, EmailTone, SendResult
 from app.services.email_generator import EmailGenerator
 from app.services.email_sender import EmailSender
-from app.services.validation import validate_email, validate_text
+from app.services.validation import (
+    MAX_BODY_LENGTH,
+    MAX_CONTEXT_LENGTH,
+    MAX_PURPOSE_LENGTH,
+    MAX_SUBJECT_LENGTH,
+    InputValidationError,
+    validate_email,
+    validate_text,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +34,7 @@ class GeneralEmailRequest:
     recipient: str
     purpose: str
     context: str
+    tone: EmailTone = EmailTone.PROFESSIONAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +110,11 @@ class GeneralEmailWorkflow:
         """Update only the generated subject."""
 
         self._require_editable(session)
-        validated = validate_text(subject, field_name="Subject", max_length=200)
+        validated = validate_text(
+            subject,
+            field_name="Subject",
+            max_length=MAX_SUBJECT_LENGTH,
+        )
         LOGGER.info("Email draft subject edited")
         return replace(session, draft=replace(session.draft, subject=validated))
 
@@ -113,7 +126,11 @@ class GeneralEmailWorkflow:
         """Update only the generated message body."""
 
         self._require_editable(session)
-        validated = validate_text(body, field_name="Message", max_length=10_000)
+        validated = validate_text(
+            body,
+            field_name="Message",
+            max_length=MAX_BODY_LENGTH,
+        )
         LOGGER.info("Email draft body edited")
         return replace(session, draft=replace(session.draft, body=validated))
 
@@ -128,7 +145,7 @@ class GeneralEmailWorkflow:
         validated = validate_text(
             context,
             field_name="Original context",
-            max_length=4000,
+            max_length=MAX_CONTEXT_LENGTH,
         )
         request = replace(session.request, context=validated)
         draft = await self._generate(request)
@@ -189,23 +206,34 @@ class GeneralEmailWorkflow:
             recipient=request.recipient,
             purpose=request.purpose,
             context=request.context,
+            tone=request.tone.value,
         )
         return replace(draft, status=EmailStatus.PREVIEWED)
 
     @staticmethod
     def _validate_request(request: GeneralEmailRequest) -> GeneralEmailRequest:
+        try:
+            tone = (
+                request.tone
+                if isinstance(request.tone, EmailTone)
+                else EmailTone(request.tone)
+            )
+        except ValueError as error:
+            raise InputValidationError("Tone is not supported.") from error
+
         return GeneralEmailRequest(
             recipient=validate_email(request.recipient),
             purpose=validate_text(
                 request.purpose,
                 field_name="Purpose",
-                max_length=200,
+                max_length=MAX_PURPOSE_LENGTH,
             ),
             context=validate_text(
                 request.context,
                 field_name="Additional context",
-                max_length=4000,
+                max_length=MAX_CONTEXT_LENGTH,
             ),
+            tone=tone,
         )
 
     @staticmethod

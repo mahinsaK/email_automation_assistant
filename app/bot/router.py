@@ -19,15 +19,39 @@ from telegram.ext import (
 from app.bot.access import owner_only
 from app.bot.handlers.common_handler import cancel, help_command, start, unknown_command
 from app.bot.handlers.general_email_handler import build_general_email_callbacks
-from app.bot.keyboards import ACTION_PATTERN, EDIT_PATTERN, EMAIL_CALLBACK_PATTERN
+from app.bot.keyboards import (
+    ACTION_PATTERN,
+    EDIT_PATTERN,
+    EMAIL_CALLBACK_PATTERN,
+    TONE_PATTERN,
+)
 from app.bot.states import GeneralEmailState
 from app.config import Settings
-from app.services.email_generator import DeterministicEmailGenerator
+from app.services.ai.openai_provider import OpenAIProvider
+from app.services.ai_email_generator import AIEmailGenerator
+from app.services.email_generator import DeterministicEmailGenerator, EmailGenerator
 from app.services.email_sender import MockEmailSender
 from app.workflows.general_email import GeneralEmailWorkflow
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def build_email_generator(settings: Settings) -> EmailGenerator:
+    """Select and construct the configured generation strategy."""
+
+    deterministic = DeterministicEmailGenerator()
+    if settings.ai_provider == "openai" and settings.openai_api_key:
+        provider = OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=settings.ai_model,
+            timeout_seconds=settings.ai_timeout_seconds,
+        )
+        LOGGER.info("AI email generation enabled with OpenAI")
+        return AIEmailGenerator(provider=provider, fallback=deterministic)
+
+    LOGGER.info("AI provider unavailable; deterministic generator enabled")
+    return deterministic
 
 
 async def handle_error(update: object, context: object) -> None:
@@ -44,7 +68,7 @@ def build_application(settings: Settings) -> Application:
     """Wire concrete dependencies and return the configured Telegram app."""
 
     workflow = GeneralEmailWorkflow(
-        generator=DeterministicEmailGenerator(),
+        generator=build_email_generator(settings),
         sender=MockEmailSender(),
     )
     callbacks = build_general_email_callbacks(workflow)
@@ -82,6 +106,12 @@ def build_application(settings: Settings) -> Application:
                     MessageHandler(
                         filters.TEXT & ~filters.COMMAND,
                         protect(callbacks.receive_context),
+                    )
+                ],
+                GeneralEmailState.WAITING_TONE: [
+                    CallbackQueryHandler(
+                        protect(callbacks.handle_tone),
+                        pattern=TONE_PATTERN,
                     )
                 ],
                 GeneralEmailState.WAITING_FOR_ACTION: [
