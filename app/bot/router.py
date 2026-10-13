@@ -21,6 +21,8 @@ from app.bot.handlers.common_handler import cancel, help_command, start, unknown
 from app.bot.handlers.general_email_handler import build_general_email_callbacks
 from app.bot.keyboards import (
     ACTION_PATTERN,
+    AI_UNAVAILABLE_PATTERN,
+    DRAFT_METHOD_PATTERN,
     EDIT_PATTERN,
     EMAIL_CALLBACK_PATTERN,
     TONE_PATTERN,
@@ -37,11 +39,11 @@ from app.workflows.general_email import GeneralEmailWorkflow
 LOGGER = logging.getLogger(__name__)
 
 
-def build_email_generator(settings: Settings) -> EmailGenerator:
-    """Select and construct the configured generation strategy."""
+def build_email_generator(settings: Settings) -> EmailGenerator | None:
+    """Build the optional real-AI strategy; never label offline fallback as AI."""
 
     deterministic = DeterministicEmailGenerator()
-    if settings.ai_provider == "openai" and settings.openai_api_key:
+    if settings.ai_enabled:
         provider = OpenAIProvider(
             api_key=settings.openai_api_key,
             model=settings.ai_model,
@@ -50,8 +52,8 @@ def build_email_generator(settings: Settings) -> EmailGenerator:
         LOGGER.info("AI email generation enabled with OpenAI")
         return AIEmailGenerator(provider=provider, fallback=deterministic)
 
-    LOGGER.info("AI provider unavailable; deterministic generator enabled")
-    return deterministic
+    LOGGER.info("AI generation unavailable; manual draft mode remains enabled")
+    return None
 
 
 async def handle_error(update: object, context: object) -> None:
@@ -94,6 +96,30 @@ def build_application(settings: Settings) -> Application:
                     MessageHandler(
                         filters.TEXT & ~filters.COMMAND,
                         protect(callbacks.receive_recipient),
+                    )
+                ],
+                GeneralEmailState.WAITING_DRAFT_METHOD: [
+                    CallbackQueryHandler(
+                        protect(callbacks.handle_draft_method),
+                        pattern=DRAFT_METHOD_PATTERN,
+                    )
+                ],
+                GeneralEmailState.MANUAL_WAITING_SUBJECT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_manual_subject),
+                    )
+                ],
+                GeneralEmailState.MANUAL_WAITING_BODY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_manual_body),
+                    )
+                ],
+                GeneralEmailState.WAITING_AI_UNAVAILABLE_ACTION: [
+                    CallbackQueryHandler(
+                        protect(callbacks.handle_ai_unavailable),
+                        pattern=AI_UNAVAILABLE_PATTERN,
                     )
                 ],
                 GeneralEmailState.WAITING_PURPOSE: [

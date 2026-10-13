@@ -11,9 +11,14 @@ from telegram import Message, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 from app.bot.keyboards import (
+    AI_CONFIGURE,
+    AI_ENTER_MANUAL,
+    AI_UNAVAILABLE_CANCEL,
     BACK_TO_PREVIEW,
     CANCEL,
     CONFIRM,
+    DRAFT_AI,
+    DRAFT_MANUAL,
     EDIT,
     EDIT_BODY,
     EDIT_CONTEXT,
@@ -21,13 +26,24 @@ from app.bot.keyboards import (
     EDIT_SUBJECT,
     REGENERATE,
     TONE_CALLBACKS,
+    ai_unavailable_keyboard,
+    draft_method_keyboard,
     edit_menu_keyboard,
     preview_actions_keyboard,
     tone_keyboard,
 )
 from app.bot.states import GeneralEmailState
-from app.services.validation import InputValidationError, validate_email, validate_text
+from app.services.validation import (
+    MAX_BODY_LENGTH,
+    MAX_CONTEXT_LENGTH,
+    MAX_PURPOSE_LENGTH,
+    MAX_SUBJECT_LENGTH,
+    InputValidationError,
+    validate_email,
+    validate_text,
+)
 from app.workflows.general_email import (
+    DraftMode,
     GeneralEmailRequest,
     GeneralEmailSession,
     GeneralEmailWorkflow,
@@ -47,6 +63,10 @@ class GeneralEmailCallbacks:
 
     begin: Callback
     receive_recipient: Callback
+    handle_draft_method: Callback
+    handle_ai_unavailable: Callback
+    receive_manual_subject: Callback
+    receive_manual_body: Callback
     receive_purpose: Callback
     receive_context: Callback
     handle_tone: Callback
@@ -85,7 +105,11 @@ async def _show_preview(message: Message, session: GeneralEmailSession) -> None:
     preview = session.draft.as_preview()
     chunks = [preview[index : index + 4000] for index in range(0, len(preview), 4000)]
     for index, chunk in enumerate(chunks):
-        keyboard = preview_actions_keyboard() if index == len(chunks) - 1 else None
+        keyboard = (
+            preview_actions_keyboard(session.draft_mode)
+            if index == len(chunks) - 1
+            else None
+        )
         await message.reply_text(chunk, reply_markup=keyboard)
 
 
@@ -126,10 +150,157 @@ def build_general_email_callbacks(
 
         if message:
             await message.reply_text(
-                "What is the purpose of the email?\n"
-                "For example: meeting request, introduction, or follow-up."
+                "How would you like to create this email?",
+                reply_markup=draft_method_keyboard(),
             )
-        return GeneralEmailState.WAITING_PURPOSE
+        return GeneralEmailState.WAITING_DRAFT_METHOD
+
+    async def handle_draft_method(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        query = update.callback_query
+        if not query:
+            return await _show_stale(update.effective_message)
+        await query.answer()
+        if not query.message:
+            return await _show_stale(None)
+
+        data = _workflow_data(context)
+        if data is None or "recipient" not in data:
+            return await _show_stale(query.message)
+
+        if query.data == DRAFT_MANUAL:
+            data["draft_mode"] = DraftMode.MANUAL
+            LOGGER.info("Manual draft mode selected")
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("Enter the email subject:")
+            return GeneralEmailState.MANUAL_WAITING_SUBJECT
+
+        if query.data == DRAFT_AI:
+            data["draft_mode"] = DraftMode.AI
+            LOGGER.info("AI draft mode selected")
+            await query.edit_message_reply_markup(reply_markup=None)
+            if workflow.ai_available:
+                await query.message.reply_text(
+                    "What is the purpose of the email?\n"
+                    "For example: meeting request, introduction, or follow-up."
+                )
+                return GeneralEmailState.WAITING_PURPOSE
+
+            LOGGER.info("AI generation unavailable")
+            await query.message.reply_text(
+                "🤖 AI generation is not configured for this environment.\n\n"
+                "You can still create and approve emails manually.",
+                reply_markup=ai_unavailable_keyboard(),
+            )
+            return GeneralEmailState.WAITING_AI_UNAVAILABLE_ACTION
+
+        LOGGER.warning("Invalid draft method callback received")
+        await query.message.reply_text(
+            "That draft method is not supported. Use one of the current buttons."
+        )
+        return GeneralEmailState.WAITING_DRAFT_METHOD
+
+    async def handle_ai_unavailable(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        query = update.callback_query
+        if not query:
+            return await _show_stale(update.effective_message)
+        await query.answer()
+        if not query.message:
+            return await _show_stale(None)
+        if _workflow_data(context) is None:
+            return await _show_stale(query.message)
+
+        if query.data == AI_CONFIGURE:
+            await query.message.reply_text(
+                "AI configuration through Telegram is not available yet. "
+                "Configure the server environment or enter the draft manually."
+            )
+            return GeneralEmailState.WAITING_AI_UNAVAILABLE_ACTION
+
+        if query.data == AI_ENTER_MANUAL:
+            data = _workflow_data(context)
+            if data is None:
+                return await _show_stale(query.message)
+            data["draft_mode"] = DraftMode.MANUAL
+            LOGGER.info("Manual draft mode selected after unavailable AI request")
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("Enter the email subject:")
+            return GeneralEmailState.MANUAL_WAITING_SUBJECT
+
+        if query.data == AI_UNAVAILABLE_CANCEL:
+            context.user_data.pop(WORKFLOW_KEY, None)
+            LOGGER.info("Email workflow cancelled")
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("❌ Email cancelled.\n\nNothing was sent.")
+            return ConversationHandler.END
+
+        LOGGER.warning("Invalid unavailable-AI action received")
+        await query.message.reply_text(
+            "That action is not supported. Use one of the current buttons."
+        )
+        return GeneralEmailState.WAITING_AI_UNAVAILABLE_ACTION
+
+    async def receive_manual_subject(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        message = update.effective_message
+        text = message.text if message else ""
+        data = _workflow_data(context)
+        if data is None:
+            return await _show_stale(message)
+        try:
+            data["manual_subject"] = validate_text(
+                text or "",
+                field_name="Subject",
+                max_length=MAX_SUBJECT_LENGTH,
+            )
+        except InputValidationError as error:
+            if message:
+                await message.reply_text(f"{error} Please enter the subject again.")
+            return GeneralEmailState.MANUAL_WAITING_SUBJECT
+
+        if message:
+            await message.reply_text("Enter the email body:")
+        return GeneralEmailState.MANUAL_WAITING_BODY
+
+    async def receive_manual_body(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        message = update.effective_message
+        text = message.text if message else ""
+        data = _workflow_data(context)
+        if data is None:
+            return await _show_stale(message)
+        try:
+            body = validate_text(
+                text or "",
+                field_name="Email body",
+                max_length=MAX_BODY_LENGTH,
+            )
+            session = workflow.start_manual(
+                recipient=str(data["recipient"]),
+                subject=str(data["manual_subject"]),
+                body=body,
+            )
+        except InputValidationError as error:
+            if message:
+                await message.reply_text(f"{error} Please enter the body again.")
+            return GeneralEmailState.MANUAL_WAITING_BODY
+        except (KeyError, TypeError):
+            context.user_data.pop(WORKFLOW_KEY, None)
+            return await _show_stale(message)
+
+        _store_session(context, session)
+        if message:
+            await _show_preview(message, session)
+        return GeneralEmailState.WAITING_FOR_ACTION
 
     async def receive_purpose(
         update: Update,
@@ -142,7 +313,7 @@ def build_general_email_callbacks(
             data["purpose"] = validate_text(
                 text or "",
                 field_name="Purpose",
-                max_length=200,
+                max_length=MAX_PURPOSE_LENGTH,
             )
         except InputValidationError as error:
             if message:
@@ -163,7 +334,7 @@ def build_general_email_callbacks(
             additional_context = validate_text(
                 text or "",
                 field_name="Additional context",
-                max_length=4000,
+                max_length=MAX_CONTEXT_LENGTH,
             )
             data = context.user_data[WORKFLOW_KEY]
             data["context"] = additional_context
@@ -273,6 +444,12 @@ def build_general_email_callbacks(
             return GeneralEmailState.WAITING_FOR_ACTION
 
         if query.data == REGENERATE:
+            if session.draft_mode is DraftMode.MANUAL:
+                LOGGER.warning("Regenerate callback rejected for manual draft")
+                await query.message.reply_text(
+                    "Manual drafts cannot be regenerated. Use Edit to change the text."
+                )
+                return GeneralEmailState.WAITING_FOR_ACTION
             try:
                 regenerated = await workflow.regenerate(session)
             except Exception:
@@ -290,7 +467,7 @@ def build_general_email_callbacks(
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
                 "What would you like to edit?",
-                reply_markup=edit_menu_keyboard(),
+                reply_markup=edit_menu_keyboard(session.draft_mode),
             )
             return GeneralEmailState.EDIT_MENU
 
@@ -335,6 +512,14 @@ def build_general_email_callbacks(
             await query.edit_message_reply_markup(reply_markup=None)
             await _show_preview(query.message, session)
             return GeneralEmailState.WAITING_FOR_ACTION
+
+        if query.data == EDIT_CONTEXT and session.draft_mode is DraftMode.MANUAL:
+            LOGGER.warning("Context edit callback rejected for manual draft")
+            await query.message.reply_text(
+                "Manual drafts do not have generation context. "
+                "Edit the subject or message instead."
+            )
+            return GeneralEmailState.EDIT_MENU
 
         selection = prompts.get(query.data or "")
         if not selection:
@@ -454,6 +639,10 @@ def build_general_email_callbacks(
     return GeneralEmailCallbacks(
         begin=begin,
         receive_recipient=receive_recipient,
+        handle_draft_method=handle_draft_method,
+        handle_ai_unavailable=handle_ai_unavailable,
+        receive_manual_subject=receive_manual_subject,
+        receive_manual_body=receive_manual_body,
         receive_purpose=receive_purpose,
         receive_context=receive_context,
         handle_tone=handle_tone,

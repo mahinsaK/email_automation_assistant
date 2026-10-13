@@ -3,6 +3,7 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.models.email import EmailTone
+from app.workflows.general_email import DraftMode
 
 
 CONFIRM = "email:confirm"
@@ -20,6 +21,15 @@ ACTION_PATTERN = r"^email:(confirm|edit|regenerate|cancel)$"
 EDIT_PATTERN = r"^email:edit:(recipient|subject|body|context|back)$"
 EMAIL_CALLBACK_PATTERN = r"^email:"
 
+DRAFT_MANUAL = "email:draft:manual"
+DRAFT_AI = "email:draft:ai"
+DRAFT_METHOD_PATTERN = r"^email:draft:(manual|ai)$"
+
+AI_CONFIGURE = "email:ai:configure"
+AI_ENTER_MANUAL = "email:ai:manual"
+AI_UNAVAILABLE_CANCEL = "email:ai:cancel"
+AI_UNAVAILABLE_PATTERN = r"^email:ai:(configure|manual|cancel)$"
+
 TONE_CALLBACK_PREFIX = "email:tone:"
 TONE_PATTERN = r"^email:tone:(professional|concise|friendly|formal)$"
 TONE_CALLBACKS = {
@@ -28,6 +38,34 @@ TONE_CALLBACKS = {
     f"{TONE_CALLBACK_PREFIX}friendly": EmailTone.FRIENDLY,
     f"{TONE_CALLBACK_PREFIX}formal": EmailTone.FORMAL,
 }
+
+
+def draft_method_keyboard() -> InlineKeyboardMarkup:
+    """Let the user explicitly choose a draft creation strategy."""
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✍️ Enter Draft", callback_data=DRAFT_MANUAL)],
+            [InlineKeyboardButton("🤖 Generate with AI", callback_data=DRAFT_AI)],
+        ]
+    )
+
+
+def ai_unavailable_keyboard() -> InlineKeyboardMarkup:
+    """Offer honest recovery choices when no real AI provider is configured."""
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔑 Configure AI", callback_data=AI_CONFIGURE)],
+            [
+                InlineKeyboardButton(
+                    "✍️ Enter Draft Instead",
+                    callback_data=AI_ENTER_MANUAL,
+                )
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data=AI_UNAVAILABLE_CANCEL)],
+        ]
+    )
 
 
 def tone_keyboard() -> InlineKeyboardMarkup:
@@ -59,30 +97,38 @@ def tone_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def preview_actions_keyboard() -> InlineKeyboardMarkup:
+def preview_actions_keyboard(draft_mode: DraftMode) -> InlineKeyboardMarkup:
     """Actions available while a draft awaits explicit approval."""
 
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Confirm & Send", callback_data=CONFIRM)],
-            [InlineKeyboardButton("✏️ Edit", callback_data=EDIT)],
+    rows = [
+        [InlineKeyboardButton("✅ Confirm & Send", callback_data=CONFIRM)],
+        [InlineKeyboardButton("✏️ Edit", callback_data=EDIT)],
+    ]
+    if draft_mode is DraftMode.AI:
+        rows.append(
             [
                 InlineKeyboardButton("🔄 Regenerate", callback_data=REGENERATE),
                 InlineKeyboardButton("❌ Cancel", callback_data=CANCEL),
-            ],
-        ]
-    )
+            ]
+        )
+    else:
+        rows.append([InlineKeyboardButton("❌ Cancel", callback_data=CANCEL)])
+    return InlineKeyboardMarkup(rows)
 
 
-def edit_menu_keyboard() -> InlineKeyboardMarkup:
+def edit_menu_keyboard(draft_mode: DraftMode) -> InlineKeyboardMarkup:
     """Structured choices for editing source data or generated content."""
 
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📧 Recipient", callback_data=EDIT_RECIPIENT)],
-            [InlineKeyboardButton("📌 Subject", callback_data=EDIT_SUBJECT)],
-            [InlineKeyboardButton("📝 Message", callback_data=EDIT_BODY)],
-            [InlineKeyboardButton("📋 Original Context", callback_data=EDIT_CONTEXT)],
-            [InlineKeyboardButton("↩️ Back to Preview", callback_data=BACK_TO_PREVIEW)],
-        ]
+    rows = [
+        [InlineKeyboardButton("📧 Recipient", callback_data=EDIT_RECIPIENT)],
+        [InlineKeyboardButton("📌 Subject", callback_data=EDIT_SUBJECT)],
+        [InlineKeyboardButton("📝 Message", callback_data=EDIT_BODY)],
+    ]
+    if draft_mode is DraftMode.AI:
+        rows.append(
+            [InlineKeyboardButton("📋 Original Context", callback_data=EDIT_CONTEXT)]
+        )
+    rows.append(
+        [InlineKeyboardButton("↩️ Back to Preview", callback_data=BACK_TO_PREVIEW)]
     )
+    return InlineKeyboardMarkup(rows)

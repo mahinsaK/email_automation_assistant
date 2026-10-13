@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from uuid import uuid4
 
 from app.models.email import EmailDraft, EmailStatus, EmailTone, SendResult
@@ -27,6 +28,17 @@ class WorkflowStateError(RuntimeError):
     """Raised when an operation is invalid for the current approval state."""
 
 
+class AIUnavailableError(WorkflowStateError):
+    """Raised when AI generation is requested without a configured provider."""
+
+
+class DraftMode(StrEnum):
+    """How the current draft was created; the email model remains shared."""
+
+    MANUAL = "manual"
+    AI = "ai"
+
+
 @dataclass(frozen=True, slots=True)
 class GeneralEmailRequest:
     """Validated source information used to generate an email draft."""
@@ -41,8 +53,9 @@ class GeneralEmailRequest:
 class GeneralEmailSession:
     """Immutable snapshot of one email's request and approval lifecycle."""
 
-    request: GeneralEmailRequest
+    request: GeneralEmailRequest | None
     draft: EmailDraft
+    draft_mode: DraftMode
     confirmation_id: str = field(default_factory=lambda: uuid4().hex)
 
 
@@ -58,11 +71,21 @@ class ApprovalOutcome:
 class GeneralEmailWorkflow:
     """Coordinate generation, editing, approval, and provider-independent send."""
 
-    def __init__(self, generator: EmailGenerator, sender: EmailSender) -> None:
+    def __init__(
+        self,
+        generator: EmailGenerator | None,
+        sender: EmailSender,
+    ) -> None:
         self._generator = generator
         self._sender = sender
         # Claim before awaiting I/O so rapid double clicks cannot send twice.
         self._claimed_confirmations: set[str] = set()
+
+    @property
+    def ai_available(self) -> bool:
+        """Whether a real AI-backed generation strategy was configured."""
+
+        return self._generator is not None
 
     async def create_draft(self, request: GeneralEmailRequest) -> EmailDraft:
         """Validate a request and generate a draft (kept for the Phase 1 API)."""
@@ -71,11 +94,46 @@ class GeneralEmailWorkflow:
         return await self._generate(validated_request)
 
     async def start(self, request: GeneralEmailRequest) -> GeneralEmailSession:
-        """Start an approval lifecycle with a newly generated preview."""
+        """Start an AI draft approval lifecycle."""
 
         validated_request = self._validate_request(request)
         draft = await self._generate(validated_request)
-        return GeneralEmailSession(request=validated_request, draft=draft)
+        LOGGER.info("AI draft generated")
+        return GeneralEmailSession(
+            request=validated_request,
+            draft=draft,
+            draft_mode=DraftMode.AI,
+        )
+
+    def start_manual(
+        self,
+        *,
+        recipient: str,
+        subject: str,
+        body: str,
+    ) -> GeneralEmailSession:
+        """Create the shared draft model directly from validated user input."""
+
+        draft = EmailDraft(
+            recipient=validate_email(recipient),
+            subject=validate_text(
+                subject,
+                field_name="Subject",
+                max_length=MAX_SUBJECT_LENGTH,
+            ),
+            body=validate_text(
+                body,
+                field_name="Email body",
+                max_length=MAX_BODY_LENGTH,
+            ),
+            status=EmailStatus.PREVIEWED,
+        )
+        LOGGER.info("Manual email draft created")
+        return GeneralEmailSession(
+            request=None,
+            draft=draft,
+            draft_mode=DraftMode.MANUAL,
+        )
 
     async def regenerate(
         self,
@@ -84,7 +142,8 @@ class GeneralEmailWorkflow:
         """Generate a fresh draft from the stored original request."""
 
         self._require_editable(session)
-        draft = await self._generate(session.request)
+        request = self._require_ai_request(session)
+        draft = await self._generate(request)
         LOGGER.info("Email draft regenerated")
         return replace(session, draft=draft)
 
@@ -97,7 +156,11 @@ class GeneralEmailWorkflow:
 
         self._require_editable(session)
         validated = validate_email(recipient)
-        request = replace(session.request, recipient=validated)
+        request = (
+            replace(session.request, recipient=validated)
+            if session.request is not None
+            else None
+        )
         draft = replace(session.draft, recipient=validated)
         LOGGER.info("Email draft recipient edited")
         return replace(session, request=request, draft=draft)
@@ -142,12 +205,13 @@ class GeneralEmailWorkflow:
         """Update source context and intentionally regenerate the entire draft."""
 
         self._require_editable(session)
+        current_request = self._require_ai_request(session)
         validated = validate_text(
             context,
             field_name="Original context",
             max_length=MAX_CONTEXT_LENGTH,
         )
-        request = replace(session.request, context=validated)
+        request = replace(current_request, context=validated)
         draft = await self._generate(request)
         LOGGER.info("Original context edited and email draft regenerated")
         return replace(session, request=request, draft=draft)
@@ -202,6 +266,8 @@ class GeneralEmailWorkflow:
         LOGGER.info("Email workflow cancelled")
 
     async def _generate(self, request: GeneralEmailRequest) -> EmailDraft:
+        if self._generator is None:
+            raise AIUnavailableError("AI email generation is not configured.")
         draft = await self._generator.generate(
             recipient=request.recipient,
             purpose=request.purpose,
@@ -240,3 +306,9 @@ class GeneralEmailWorkflow:
     def _require_editable(session: GeneralEmailSession) -> None:
         if session.draft.status is not EmailStatus.PREVIEWED:
             raise WorkflowStateError("Only a draft awaiting approval can be changed.")
+
+    @staticmethod
+    def _require_ai_request(session: GeneralEmailSession) -> GeneralEmailRequest:
+        if session.draft_mode is not DraftMode.AI or session.request is None:
+            raise WorkflowStateError("Manual drafts cannot be regenerated from context.")
+        return session.request

@@ -1,10 +1,10 @@
 # AI Email Automation Assistant
 
 An extensible, human-in-the-loop email automation system with Telegram as its
-first interface. Phase 3 optionally creates validated AI-backed email drafts,
-lets the user edit or regenerate them, and requires explicit approval before a
-simulated send. Without an AI key it remains fully usable offline with the
-deterministic generator.
+first interface. Phase 3.5 lets the user either enter an email manually or use a
+configured AI provider. Both paths create the same immutable `EmailDraft`, then
+reuse the same preview, editing, approval, cancellation, and simulated-send
+lifecycle.
 
 No real email is delivered in this phase.
 
@@ -19,20 +19,68 @@ Invalid input stays in the current state, explains the problem, and asks again.
 Temporary data is stored under a workflow-specific key in Telegram `user_data`
 and removed on completion or cancellation.
 
-## Phase 2 approval workflow
+## Draft creation modes
+
+After a valid recipient is entered, the user explicitly chooses a creation
+strategy:
+
+- **Manual mode** asks for a subject and body, validates both, and proceeds
+  directly to preview. It never invokes an AI or deterministic generator and
+  works without an API key.
+- **AI mode** is offered as a real capability only when an AI provider is
+  configured. It collects purpose, context, and tone before using the existing
+  AI generation pipeline. If AI is unavailable, the bot explains why and offers
+  manual drafting, a configuration placeholder, or cancellation.
+
+Text created elsewhere can also be pasted into manual mode. The bot does not
+need to know whether it was written by a person or another tool:
+
+```text
+ChatGPT / Gemini / Claude
+          ↓
+Copy subject and body
+          ↓
+Telegram manual mode
+          ↓
+Preview → Approve
+```
+
+The deterministic generator remains available for tests, offline development,
+and as the internal fallback after a configured AI provider attempt fails. It is
+not presented to users as AI.
+
+## Phase 3.5 workflow
 
 ```text
 /send
   ↓
 WAITING_RECIPIENT
   ↓
-WAITING_PURPOSE
-  ↓
-WAITING_CONTEXT
-  ↓
-WAITING_TONE
-  ↓
-GENERATE
+WAITING_DRAFT_METHOD
+  │
+  ├── MANUAL
+  │     ↓
+  │   MANUAL_WAITING_SUBJECT
+  │     ↓
+  │   MANUAL_WAITING_BODY
+  │     ↓
+  │   EmailDraft
+  │
+  └── AI
+        ↓
+      Availability check
+        │
+        ├── unavailable → Explain → Manual / Configure placeholder / Cancel
+        │
+        └── available
+              ↓
+            WAITING_PURPOSE
+              ↓
+            WAITING_CONTEXT
+              ↓
+            WAITING_TONE
+              ↓
+            Generate → EmailDraft
   ↓
 WAITING_FOR_ACTION
   │
@@ -42,7 +90,7 @@ WAITING_FOR_ACTION
   │      ↓
   │     END
   │
-  ├── REGENERATE
+  ├── REGENERATE (AI drafts only)
   │      ↓
   │   Generate Again
   │      ↓
@@ -54,7 +102,7 @@ WAITING_FOR_ACTION
   │    ├── EDIT_RECIPIENT
   │    ├── EDIT_SUBJECT
   │    ├── EDIT_BODY
-  │    ├── EDIT_CONTEXT → Generate Again
+  │    ├── EDIT_CONTEXT → Generate Again (AI drafts only)
   │    └── Back to Preview
   │
   └── CANCEL
@@ -62,7 +110,12 @@ WAITING_FOR_ACTION
         END
 ```
 
-The preview has four inline actions:
+AI previews have Confirm, Edit, Regenerate, and Cancel actions. Manual previews
+omit Regenerate because there is no generator input to replay. The manual edit
+menu similarly omits Original Context; recipient, subject, and message editing
+remain available.
+
+The shared approval actions are:
 
 - **Confirm & Send** — explicitly approves the current draft and calls the mock
   sender. The response clearly says that delivery was simulated.
@@ -71,16 +124,15 @@ The preview has four inline actions:
 - **Regenerate** — calls the generator again with the stored request data.
 - **Cancel** — discards temporary state without calling the sender.
 
-With AI enabled, regeneration calls the provider again with the stored recipient,
-purpose, context, and tone, so the result may differ. Offline regeneration uses
-the deterministic fallback and may produce the same draft. Approval semantics are
-identical in both modes.
+With AI enabled, regeneration calls the AI generator again with the stored
+recipient, purpose, context, and tone, so the result may differ. If the provider
+attempt fails, the AI generator may return its deterministic fallback. That
+resilience behavior is separate from the UI-level availability check.
 
-Recipient edits update both the source request and current draft but preserve the
-subject and body. Subject and body edits affect only generated content. Context
-edits update source data and intentionally regenerate the whole draft. Manual
-subject/body changes are therefore retained until the user explicitly requests a
-regeneration or context-based regeneration.
+Recipient edits preserve subject and body. For AI drafts they also update the
+stored source request. Subject and body edits affect only the current draft.
+Context edits exist only for AI drafts, update source data, and intentionally
+regenerate the whole draft.
 
 ## Architecture
 
@@ -89,18 +141,21 @@ Telegram
    ↓
 Handler + explicit conversation states
    ↓
-GeneralEmailWorkflow
-   ├── EmailGenerator protocol (strategy)
-   │      ├── DeterministicEmailGenerator
-   │      └── AIEmailGenerator
-   │              ↓
-   │          LLMProvider protocol
-   │              ↓
-   │          OpenAIProvider
-   │
-   └── EmailSender protocol
-          ↓
-      MockEmailSender
+Draft creation strategy
+   ├── Manual input ─────────────────────┐
+   └── Optional AIEmailGenerator         │
+              ├── LLMProvider            │
+              │      ↓                   │
+              │   OpenAIProvider         │
+              └── Deterministic fallback │
+                                         ↓
+                                shared EmailDraft
+                                         ↓
+                              GeneralEmailWorkflow
+                                         ↓
+                                 EmailSender protocol
+                                         ↓
+                                   MockEmailSender
 ```
 
 ```text
@@ -125,11 +180,11 @@ main.py                     # Executable entry point
 ### Engineering decisions
 
 - **Strategy and dependency inversion:** `GeneralEmailWorkflow` still depends on
-  `EmailGenerator` and `EmailSender`, never OpenAI. AI and deterministic
-  generators are interchangeable strategies.
+  the `EmailGenerator` and `EmailSender` interfaces, never OpenAI. Manual input
+  and AI generation are two strategies for constructing the same domain value.
 - **Dependency injection:** `build_application` is the composition root. It wires
-  the configured generator and `MockEmailSender` into the workflow, then injects
-  that workflow into Telegram callbacks.
+  an `AIEmailGenerator` only when a real provider is configured, plus the
+  `MockEmailSender`, then injects the workflow into Telegram callbacks.
 - **Adapter pattern:** `OpenAIProvider` translates the external asynchronous
   Responses API into the internal `LLMProvider` interface.
 - **Boundary validation:** untrusted provider output must pass the strict
@@ -143,13 +198,17 @@ main.py                     # Executable entry point
 - **Prompt separation:** stable system rules prohibit invented facts and treat a
   JSON-encoded request as untrusted data. User context cannot become application
   or system instructions merely by appearing in the prompt.
-- **State machine:** input, approval, menu, and field-edit behavior use explicit
-  enum states instead of combinations of boolean flags.
+- **Accurate capability signaling:** the AI button checks the centrally composed
+  capability. A deterministic fallback is never described as available AI.
+- **State machine:** manual and AI branches use explicit enum states, then
+  converge at the existing preview/action state.
 - **Immutability:** `EmailDraft`, request, and session snapshots are frozen
   dataclasses. Edits use `dataclasses.replace`, so an earlier value cannot be
   changed unexpectedly through a shared reference.
 - **Human-in-the-loop:** generation only reaches `EmailSender` from the Confirm
   callback. Preview, edit, regenerate, and cancel never imply approval.
+- **Progressive enhancement:** manual drafting provides the complete approval
+  experience without AI; a configured provider adds generation and regeneration.
 - **Test double:** `MockEmailSender` is most accurately an in-memory **fake**—a
   working but non-production implementation. It can simulate success or failure
   and records requests for verification. “Mock” remains in its class name because
@@ -216,9 +275,13 @@ AI_MODEL=gpt-4o-mini
 AI_TIMEOUT_SECONDS=30
 ```
 
-- With an OpenAI key, the composition root injects `AIEmailGenerator`.
-- Without a key, it injects `DeterministicEmailGenerator`.
-- Set `AI_PROVIDER=deterministic` to force offline mode even when a key exists.
+- With an OpenAI key, the composition root injects `AIEmailGenerator` and the AI
+  path is available.
+- Without a key, manual mode remains fully functional and choosing AI displays an
+  honest unavailable message with a manual fallback action.
+- Set `AI_PROVIDER=deterministic` to disable the user-facing AI path even when a
+  key exists. The deterministic implementation remains available internally for
+  development, tests, and AI-provider fallback.
 
 Then run:
 
@@ -235,22 +298,24 @@ the configured sender only simulates delivery.
 pytest
 ```
 
-Tests cover validation, deterministic generation, confirmation, cancellation,
-regeneration, every edit type, invalid edited recipients, sender failure and
-retry, duplicate confirmation, stale callbacks, tone selection, valid and invalid
-AI output, provider failure, fallback, optional configuration, prompt contents,
-and complete fake-provider composition. They do not contact Telegram, Gmail, or
-an AI provider.
+Tests cover manual/AI selection, manual validation and construction, dynamic
+preview/edit actions, both complete smoke flows, deterministic fallback,
+confirmation, cancellation, regeneration, every edit type, sender failure and
+retry, duplicate confirmation, stale callbacks, AI output validation, optional
+configuration, and prompt contents. They do not contact Telegram, Gmail, or a
+real AI provider.
 
 ## Why Gmail is absent
 
-Phase 3 preserves the proven approval lifecycle while adding generation only.
-This isolates state-machine, editing, idempotency, and failure-recovery bugs while
-all sends are harmless and deterministic. Gmail API and OAuth belong to Phase 5,
-after the AI and job-application workflows are stable.
+Phase 3.5 improves draft creation without changing the proven approval lifecycle.
+Keeping delivery simulated isolates state-machine, editing, idempotency, and
+failure-recovery behavior while all sends remain harmless. Gmail API and OAuth
+belong to a later phase.
 
 ## Current checkpoint
 
-Phase 3 is implemented with an optional OpenAI generation adapter. Gemini, Claude,
-Gmail, OAuth, attachments, job applications, databases, scheduling, and real
-delivery remain intentionally absent. `MockEmailSender` is still the only sender.
+Phase 3.5 is implemented with manual drafting and an optional OpenAI generation
+adapter. Gemini and Claude may be used externally and pasted through manual mode,
+but are not integrated. Gmail, OAuth, attachments, job applications, databases,
+scheduling, and real delivery remain intentionally absent. `MockEmailSender` is
+still the only sender.

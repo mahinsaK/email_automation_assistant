@@ -28,6 +28,12 @@ class Settings:
     ai_model: str = DEFAULT_AI_MODEL
     ai_timeout_seconds: float = 30.0
 
+    @property
+    def ai_enabled(self) -> bool:
+        """Whether a real supported AI provider is fully configured."""
+
+        return self.ai_provider == "openai" and bool(self.openai_api_key)
+
     @classmethod
     def from_env(cls) -> "Settings":
         """Load settings from environment variables and an optional local .env file."""
