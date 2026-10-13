@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import warnings
 
 from telegram import Update
+from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     MessageHandler,
@@ -16,9 +19,11 @@ from telegram.ext import (
 from app.bot.access import owner_only
 from app.bot.handlers.common_handler import cancel, help_command, start, unknown_command
 from app.bot.handlers.general_email_handler import build_general_email_callbacks
+from app.bot.keyboards import ACTION_PATTERN, EDIT_PATTERN, EMAIL_CALLBACK_PATTERN
 from app.bot.states import GeneralEmailState
 from app.config import Settings
 from app.services.email_generator import DeterministicEmailGenerator
+from app.services.email_sender import MockEmailSender
 from app.workflows.general_email import GeneralEmailWorkflow
 
 
@@ -38,38 +43,102 @@ async def handle_error(update: object, context: object) -> None:
 def build_application(settings: Settings) -> Application:
     """Wire concrete dependencies and return the configured Telegram app."""
 
-    workflow = GeneralEmailWorkflow(DeterministicEmailGenerator())
-    begin, recipient, purpose, additional_context = build_general_email_callbacks(
-        workflow
+    workflow = GeneralEmailWorkflow(
+        generator=DeterministicEmailGenerator(),
+        sender=MockEmailSender(),
     )
+    callbacks = build_general_email_callbacks(workflow)
     protect = owner_only(settings.allowed_telegram_user_id)
 
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.add_handler(CommandHandler("start", protect(start)))
     application.add_handler(CommandHandler("help", protect(help_command)))
-    application.add_handler(
-        ConversationHandler(
-            entry_points=[CommandHandler("send", protect(begin))],
+    # This conversation intentionally spans multiple text and callback messages,
+    # so it must be keyed per user/chat rather than per Telegram message. PTB emits
+    # a generic warning for that valid mixed-handler design; suppress only that
+    # exact warning while constructing this handler.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="If 'per_message=False'.*",
+            category=PTBUserWarning,
+        )
+        conversation_handler = ConversationHandler(
+            entry_points=[CommandHandler("send", protect(callbacks.begin))],
             states={
                 GeneralEmailState.WAITING_RECIPIENT: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, protect(recipient))
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_recipient),
+                    )
                 ],
                 GeneralEmailState.WAITING_PURPOSE: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, protect(purpose))
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_purpose),
+                    )
                 ],
                 GeneralEmailState.WAITING_CONTEXT: [
                     MessageHandler(
                         filters.TEXT & ~filters.COMMAND,
-                        protect(additional_context),
+                        protect(callbacks.receive_context),
+                    )
+                ],
+                GeneralEmailState.WAITING_FOR_ACTION: [
+                    CallbackQueryHandler(
+                        protect(callbacks.handle_action),
+                        pattern=ACTION_PATTERN,
+                    )
+                ],
+                GeneralEmailState.EDIT_MENU: [
+                    CallbackQueryHandler(
+                        protect(callbacks.handle_edit_choice),
+                        pattern=EDIT_PATTERN,
+                    )
+                ],
+                GeneralEmailState.EDIT_RECIPIENT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_edited_recipient),
+                    )
+                ],
+                GeneralEmailState.EDIT_SUBJECT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_edited_subject),
+                    )
+                ],
+                GeneralEmailState.EDIT_BODY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_edited_body),
+                    )
+                ],
+                GeneralEmailState.EDIT_CONTEXT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(callbacks.receive_edited_context),
                     )
                 ],
             },
-            fallbacks=[CommandHandler("cancel", protect(cancel))],
+            fallbacks=[
+                CommandHandler("cancel", protect(cancel)),
+                CallbackQueryHandler(
+                    protect(callbacks.handle_invalid_callback),
+                    pattern=EMAIL_CALLBACK_PATTERN,
+                ),
+            ],
             allow_reentry=True,
         )
-    )
+    application.add_handler(conversation_handler)
     application.add_handler(CommandHandler("cancel", protect(cancel)))
     application.add_handler(MessageHandler(filters.COMMAND, protect(unknown_command)))
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(callbacks.handle_invalid_callback),
+            pattern=EMAIL_CALLBACK_PATTERN,
+        )
+    )
     application.add_error_handler(handle_error)
     return application
 

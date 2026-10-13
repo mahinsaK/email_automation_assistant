@@ -1,13 +1,18 @@
 """Handlers shared across Telegram workflows."""
 
+import logging
+
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 WELCOME_TEXT = (
     "Welcome to AI Email Automation Assistant.\n\n"
-    "I can help you create a professional email draft for review. "
-    "Nothing will be sent in Phase 1.\n\n"
+    "I can help you create, edit, and approve a professional email draft. "
+    "Email delivery is simulated during Phase 2; no real email is sent.\n\n"
     "Use /send to create a draft or /help to see available commands."
 )
 
@@ -38,9 +43,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Clear temporary state and end the current conversation."""
 
     context.user_data.pop("general_email", None)
+    LOGGER.info("Email workflow cancelled")
     if update.effective_message:
         await update.effective_message.reply_text(
-            "Cancelled. No email was sent. Use /send when you want to start again."
+            "❌ Email cancelled. Nothing was sent. Use /send to start again."
         )
     return ConversationHandler.END
 

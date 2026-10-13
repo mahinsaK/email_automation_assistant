@@ -12,6 +12,17 @@ class EmailStatus(StrEnum):
 
     DRAFT = "draft"
     PREVIEWED = "previewed"
+    SENDING = "sending"
+    SENT = "sent"
+
+
+@dataclass(frozen=True, slots=True)
+class SendResult:
+    """Provider-independent result returned by an email sender."""
+
+    success: bool
+    message_id: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
