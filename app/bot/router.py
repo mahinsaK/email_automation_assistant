@@ -22,6 +22,9 @@ from app.bot.handlers.ai_configuration_handler import (
 )
 from app.bot.handlers.common_handler import cancel, help_command, start, unknown_command
 from app.bot.handlers.general_email_handler import build_general_email_callbacks
+from app.bot.handlers.job_application_handler import (
+    build_job_application_callbacks,
+)
 from app.bot.keyboards import (
     ACTION_PATTERN,
     AI_CONFIG_CALLBACK_PATTERN,
@@ -34,11 +37,17 @@ from app.bot.keyboards import (
     DRAFT_METHOD_PATTERN,
     EDIT_PATTERN,
     EMAIL_CALLBACK_PATTERN,
+    JOB_ACTION_PATTERN,
+    JOB_AI_UNAVAILABLE_PATTERN,
+    JOB_CALLBACK_PATTERN,
+    JOB_DRAFT_METHOD_PATTERN,
+    JOB_EDIT_PATTERN,
+    JOB_TONE_PATTERN,
     TONE_PATTERN,
 )
-from app.bot.states import GeneralEmailState
+from app.bot.states import GeneralEmailState, JobApplicationState
 from app.config import Settings
-from app.models.ai_configuration import AIProviderType
+from app.models.ai_configuration import AIProviderType, ResolvedAIConfiguration
 from app.repositories.ai_configuration import (
     AIConfigurationRepositoryError,
     SQLiteAIConfigurationRepository,
@@ -48,11 +57,24 @@ from app.services.ai.openai_provider import OpenAIProvider
 from app.services.ai.provider_factory import AIProviderFactory
 from app.services.ai_configuration import UserAIConfigurationService
 from app.services.ai_email_generator import AIEmailGenerator
+from app.services.attachment import CVAttachmentService
+from app.services.candidate_profile import CandidateProfileService
 from app.services.credential_cipher import CredentialCipherError, FernetCredentialCipher
 from app.services.email_generator import DeterministicEmailGenerator, EmailGenerator
 from app.services.email_sender import MockEmailSender
-from app.services.user_email_generator import ConfiguredUserEmailGeneratorResolver
+from app.services.job_application_generator import (
+    ConfiguredUserJobApplicationGeneratorResolver,
+)
+from app.services.job_requirements import (
+    CandidateRequirementMatcher,
+    DeterministicJobRequirementExtractor,
+)
+from app.services.user_email_generator import (
+    ConfiguredUserAIProviderResolver,
+    ConfiguredUserEmailGeneratorResolver,
+)
 from app.workflows.general_email import GeneralEmailWorkflow
+from app.workflows.job_application import JobApplicationWorkflow
 
 
 LOGGER = logging.getLogger(__name__)
@@ -111,27 +133,53 @@ def build_application(settings: Settings) -> Application:
             )
         },
     )
-    application_generator = build_email_generator(settings)
-    generator_resolver = ConfiguredUserEmailGeneratorResolver(
+    provider_factory = AIProviderFactory(
+        model=settings.ai_model,
+        timeout_seconds=settings.ai_timeout_seconds,
+    )
+    application_configuration = (
+        ResolvedAIConfiguration(
+            provider=AIProviderType.OPENAI,
+            api_key=settings.openai_api_key,
+        )
+        if settings.ai_enabled and settings.openai_api_key
+        else None
+    )
+    provider_resolver = ConfiguredUserAIProviderResolver(
         configuration_service=configuration_service,
-        provider_factory=AIProviderFactory(
-            model=settings.ai_model,
-            timeout_seconds=settings.ai_timeout_seconds,
-        ),
-        application_generator=application_generator,
+        provider_factory=provider_factory,
+        application_configuration=application_configuration,
+    )
+    generator_resolver = ConfiguredUserEmailGeneratorResolver(
+        provider_resolver=provider_resolver,
+    )
+    job_generator_resolver = ConfiguredUserJobApplicationGeneratorResolver(
+        provider_resolver=provider_resolver,
     )
     workflow = GeneralEmailWorkflow(
         generator=None,
         sender=MockEmailSender(),
     )
+    job_workflow = JobApplicationWorkflow(
+        profile_service=CandidateProfileService(settings.candidate_profile_path),
+        attachment_service=CVAttachmentService(settings.cv_file_path),
+        requirement_extractor=DeterministicJobRequirementExtractor(),
+        matcher=CandidateRequirementMatcher(),
+        approval_workflow=workflow,
+    )
     ai_callbacks = build_ai_configuration_callbacks(
         configuration_service,
-        application_ai_available=application_generator is not None,
+        application_ai_available=application_configuration is not None,
     )
     callbacks = build_general_email_callbacks(
         workflow,
         generator_resolver=generator_resolver,
         start_ai_configuration=ai_callbacks.begin_from_email,
+    )
+    job_callbacks = build_job_application_callbacks(
+        job_workflow,
+        generator_resolver=job_generator_resolver,
+        start_ai_configuration=ai_callbacks.begin_from_job,
     )
     protect = owner_only(settings.allowed_telegram_user_id)
 
@@ -163,6 +211,7 @@ def build_application(settings: Settings) -> Application:
         conversation_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("send", protect(callbacks.begin)),
+                CommandHandler("apply", protect(job_callbacks.begin)),
                 CommandHandler("configure_ai", protect(ai_callbacks.begin)),
                 CommandHandler("remove_ai", protect(ai_callbacks.begin_remove)),
             ],
@@ -281,6 +330,108 @@ def build_application(settings: Settings) -> Application:
                         pattern=AI_REMOVE_PATTERN,
                     )
                 ],
+                JobApplicationState.WAITING_COMPANY_EMAIL: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_company_email),
+                    )
+                ],
+                JobApplicationState.WAITING_COMPANY_NAME: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_company_name),
+                    )
+                ],
+                JobApplicationState.WAITING_ROLE: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_role),
+                    )
+                ],
+                JobApplicationState.WAITING_JOB_DESCRIPTION: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_job_description),
+                    )
+                ],
+                JobApplicationState.WAITING_DRAFT_METHOD: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_draft_method),
+                        pattern=JOB_DRAFT_METHOD_PATTERN,
+                    )
+                ],
+                JobApplicationState.MANUAL_WAITING_SUBJECT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_manual_subject),
+                    )
+                ],
+                JobApplicationState.MANUAL_WAITING_BODY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_manual_body),
+                    )
+                ],
+                JobApplicationState.WAITING_AI_UNAVAILABLE_ACTION: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_ai_unavailable),
+                        pattern=JOB_AI_UNAVAILABLE_PATTERN,
+                    )
+                ],
+                JobApplicationState.WAITING_TONE: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_tone),
+                        pattern=JOB_TONE_PATTERN,
+                    )
+                ],
+                JobApplicationState.WAITING_FOR_ACTION: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_action),
+                        pattern=JOB_ACTION_PATTERN,
+                    )
+                ],
+                JobApplicationState.EDIT_MENU: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_edit_choice),
+                        pattern=JOB_EDIT_PATTERN,
+                    )
+                ],
+                JobApplicationState.EDIT_RECIPIENT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_recipient),
+                    )
+                ],
+                JobApplicationState.EDIT_COMPANY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_company),
+                    )
+                ],
+                JobApplicationState.EDIT_ROLE: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_role),
+                    )
+                ],
+                JobApplicationState.EDIT_JOB_DESCRIPTION: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_job_description),
+                    )
+                ],
+                JobApplicationState.EDIT_SUBJECT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_subject),
+                    )
+                ],
+                JobApplicationState.EDIT_BODY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_body),
+                    )
+                ],
             },
             fallbacks=[
                 CommandHandler("cancel", protect(cancel)),
@@ -295,6 +446,10 @@ def build_application(settings: Settings) -> Application:
                 CallbackQueryHandler(
                     protect(callbacks.handle_invalid_callback),
                     pattern=EMAIL_CALLBACK_PATTERN,
+                ),
+                CallbackQueryHandler(
+                    protect(job_callbacks.handle_invalid_callback),
+                    pattern=JOB_CALLBACK_PATTERN,
                 ),
             ],
             allow_reentry=True,
@@ -318,6 +473,12 @@ def build_application(settings: Settings) -> Application:
         CallbackQueryHandler(
             protect(callbacks.handle_invalid_callback),
             pattern=EMAIL_CALLBACK_PATTERN,
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(job_callbacks.handle_invalid_callback),
+            pattern=JOB_CALLBACK_PATTERN,
         )
     )
     application.add_error_handler(handle_error)

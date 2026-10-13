@@ -1,0 +1,21 @@
+{
+  "name": "Candidate Name",
+  "email": null,
+  "phone": null,
+  "location": null,
+  "summary": "Replace this placeholder with a truthful professional summary.",
+  "education": [
+    {
+      "degree": "Degree Name",
+      "institution": "Institution Name",
+      "graduation_year": 2028
+    }
+  ],
+  "skills": [
+    "Replace with a verified skill"
+  ],
+  "projects": [],
+  "experience": [],
+  "certifications": [],
+  "achievements": []
+}

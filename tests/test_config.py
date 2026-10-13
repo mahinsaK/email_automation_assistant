@@ -13,6 +13,8 @@ def test_ai_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("AI_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY", "test-encryption-key")
     monkeypatch.setenv("DATABASE_PATH", "data/test.db")
+    monkeypatch.setenv("CANDIDATE_PROFILE_PATH", "data/test-profile.json")
+    monkeypatch.setenv("CV_FILE_PATH", "attachments/test-cv.pdf")
 
     settings = Settings.from_env()
 
@@ -21,6 +23,8 @@ def test_ai_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     assert settings.ai_timeout_seconds == 12.5
     assert settings.credential_encryption_key == "test-encryption-key"
     assert settings.database_path == "data/test.db"
+    assert settings.candidate_profile_path == "data/test-profile.json"
+    assert settings.cv_file_path == "attachments/test-cv.pdf"
 
 
 def test_unknown_ai_provider_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

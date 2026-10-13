@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 
 DEFAULT_AI_MODEL = "gpt-4o-mini"
 DEFAULT_DATABASE_PATH = "data/email_assistant.db"
+DEFAULT_CANDIDATE_PROFILE_PATH = "data/candidate_profile.json"
+DEFAULT_CV_FILE_PATH = "attachments/CV.pdf"
 SUPPORTED_AI_PROVIDERS = {"openai", "deterministic"}
 
 
@@ -30,6 +32,8 @@ class Settings:
     ai_timeout_seconds: float = 30.0
     credential_encryption_key: str | None = None
     database_path: str = DEFAULT_DATABASE_PATH
+    candidate_profile_path: str = DEFAULT_CANDIDATE_PROFILE_PATH
+    cv_file_path: str = DEFAULT_CV_FILE_PATH
 
     @property
     def ai_enabled(self) -> bool:
@@ -73,6 +77,14 @@ class Settings:
             os.getenv("DATABASE_PATH", DEFAULT_DATABASE_PATH).strip()
             or DEFAULT_DATABASE_PATH
         )
+        candidate_profile_path = (
+            os.getenv("CANDIDATE_PROFILE_PATH", DEFAULT_CANDIDATE_PROFILE_PATH).strip()
+            or DEFAULT_CANDIDATE_PROFILE_PATH
+        )
+        cv_file_path = (
+            os.getenv("CV_FILE_PATH", DEFAULT_CV_FILE_PATH).strip()
+            or DEFAULT_CV_FILE_PATH
+        )
         timeout_value = os.getenv("AI_TIMEOUT_SECONDS", "30").strip()
         try:
             ai_timeout_seconds = float(timeout_value)
@@ -93,5 +105,7 @@ class Settings:
             ai_timeout_seconds=ai_timeout_seconds,
             credential_encryption_key=credential_encryption_key,
             database_path=database_path,
+            candidate_profile_path=candidate_profile_path,
+            cv_file_path=cv_file_path,
         )
 

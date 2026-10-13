@@ -12,9 +12,10 @@ LOGGER = logging.getLogger(__name__)
 WELCOME_TEXT = (
     "Welcome to AI Email Automation Assistant.\n\n"
     "I can help you enter a draft manually or create one with configured AI, "
-    "then edit and approve it. "
+    "then edit and approve it. I can also prepare grounded job application "
+    "emails with your configured CV. "
     "Email delivery is still simulated; no real email is sent.\n\n"
-    "Use /send to create a draft or /help to see available commands."
+    "Use /send for a general email, /apply for a job application, or /help."
 )
 
 HELP_TEXT = (
@@ -22,6 +23,7 @@ HELP_TEXT = (
     "/start - Show the welcome message\n"
     "/help - Show this help\n"
     "/send - Create a general email draft\n"
+    "/apply - Create a job/internship application email with CV attachment\n"
     "/configure_ai - Configure or replace your AI provider credential\n"
     "/ai_status - Show your AI configuration status\n"
     "/remove_ai - Remove your saved AI configuration\n"
@@ -47,11 +49,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Clear temporary state and end the current conversation."""
 
     context.user_data.pop("general_email", None)
+    context.user_data.pop("job_application", None)
     context.user_data.pop("ai_configuration", None)
-    LOGGER.info("Email workflow cancelled")
+    LOGGER.info("Active email workflow cancelled")
     if update.effective_message:
         await update.effective_message.reply_text(
-            "❌ Email cancelled. Nothing was sent. Use /send to start again."
+            "❌ Workflow cancelled. Nothing was sent. "
+            "Use /send or /apply to start again."
         )
     return ConversationHandler.END
 

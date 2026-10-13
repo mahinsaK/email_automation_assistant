@@ -9,6 +9,9 @@ htmlcov/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/candidate_profile.json
+attachments/*
+!attachments/.gitkeep
 .idea/
 .vscode/
 .DS_Store

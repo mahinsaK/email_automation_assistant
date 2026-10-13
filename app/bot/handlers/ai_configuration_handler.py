@@ -22,8 +22,9 @@ from app.bot.keyboards import (
     ai_replace_keyboard,
     ai_validation_retry_keyboard,
     draft_method_keyboard,
+    job_draft_method_keyboard,
 )
-from app.bot.states import GeneralEmailState
+from app.bot.states import GeneralEmailState, JobApplicationState
 from app.models.ai_configuration import AIProviderType
 from app.services.ai_configuration import (
     AIConfigurationUnavailableError,
@@ -37,6 +38,7 @@ from app.services.ai_configuration import (
 LOGGER = logging.getLogger(__name__)
 CONFIGURATION_KEY = "ai_configuration"
 EMAIL_WORKFLOW_KEY = "general_email"
+JOB_WORKFLOW_KEY = "job_application"
 
 Callback = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[int | None]]
 
@@ -47,6 +49,7 @@ class AIConfigurationCallbacks:
 
     begin: Callback
     begin_from_email: Callback
+    begin_from_job: Callback
     handle_replace: Callback
     handle_provider: Callback
     receive_api_key: Callback
@@ -79,23 +82,39 @@ def build_ai_configuration_callbacks(
         context: ContextTypes.DEFAULT_TYPE,
     ) -> int:
         data = _configuration_data(context)
-        resume_email = bool(data and data.get("resume_email"))
+        resume_workflow = data.get("resume_workflow") if data else None
         context.user_data.pop(CONFIGURATION_KEY, None)
         email_data = context.user_data.get(EMAIL_WORKFLOW_KEY)
-        if resume_email and isinstance(email_data, dict) and "recipient" in email_data:
+        if (
+            resume_workflow == "general"
+            and isinstance(email_data, dict)
+            and "recipient" in email_data
+        ):
             if message:
                 await message.reply_text(
                     "How would you like to create this email?",
                     reply_markup=draft_method_keyboard(),
                 )
             return GeneralEmailState.WAITING_DRAFT_METHOD
+        job_data = context.user_data.get(JOB_WORKFLOW_KEY)
+        if (
+            resume_workflow == "job"
+            and isinstance(job_data, dict)
+            and "job_description" in job_data
+        ):
+            if message:
+                await message.reply_text(
+                    "How would you like to create the application email?",
+                    reply_markup=job_draft_method_keyboard(),
+                )
+            return JobApplicationState.WAITING_DRAFT_METHOD
         return ConversationHandler.END
 
     async def _begin(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         *,
-        resume_email: bool,
+        resume_workflow: str | None,
     ) -> int:
         message = update.effective_message
         user_id = _telegram_user_id(update)
@@ -103,7 +122,9 @@ def build_ai_configuration_callbacks(
             return ConversationHandler.END
 
         LOGGER.info("AI configuration started")
-        context.user_data[CONFIGURATION_KEY] = {"resume_email": resume_email}
+        context.user_data[CONFIGURATION_KEY] = {
+            "resume_workflow": resume_workflow
+        }
         if not service.credential_storage_available:
             await message.reply_text(
                 "⚠️ Secure AI credential storage is not available.\n\n"
@@ -137,15 +158,28 @@ def build_ai_configuration_callbacks(
         return GeneralEmailState.AI_CONFIG_PROVIDER
 
     async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        job_data = context.user_data.get(JOB_WORKFLOW_KEY)
+        if isinstance(job_data, dict) and "job_description" in job_data:
+            return await _begin(update, context, resume_workflow="job")
         email_data = context.user_data.get(EMAIL_WORKFLOW_KEY)
-        resume_email = isinstance(email_data, dict) and "recipient" in email_data
-        return await _begin(update, context, resume_email=resume_email)
+        resume_workflow = (
+            "general"
+            if isinstance(email_data, dict) and "recipient" in email_data
+            else None
+        )
+        return await _begin(update, context, resume_workflow=resume_workflow)
 
     async def begin_from_email(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> int:
-        return await _begin(update, context, resume_email=True)
+        return await _begin(update, context, resume_workflow="general")
+
+    async def begin_from_job(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> int:
+        return await _begin(update, context, resume_workflow="job")
 
     async def _cancel(
         query: Any,
@@ -432,6 +466,7 @@ def build_ai_configuration_callbacks(
     return AIConfigurationCallbacks(
         begin=begin,
         begin_from_email=begin_from_email,
+        begin_from_job=begin_from_job,
         handle_replace=handle_replace,
         handle_provider=handle_provider,
         receive_api_key=receive_api_key,

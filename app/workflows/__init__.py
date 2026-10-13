@@ -9,6 +9,12 @@ from app.workflows.general_email import (
     GeneralEmailWorkflow,
     WorkflowStateError,
 )
+from app.workflows.job_application import (
+    JobApplicationApprovalOutcome,
+    JobApplicationResources,
+    JobApplicationSession,
+    JobApplicationWorkflow,
+)
 
 __all__ = [
     "ApprovalOutcome",
@@ -17,6 +23,10 @@ __all__ = [
     "GeneralEmailRequest",
     "GeneralEmailSession",
     "GeneralEmailWorkflow",
+    "JobApplicationApprovalOutcome",
+    "JobApplicationResources",
+    "JobApplicationSession",
+    "JobApplicationWorkflow",
     "WorkflowStateError",
 ]
 

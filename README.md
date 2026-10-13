@@ -1,11 +1,11 @@
 # AI Email Automation Assistant
 
 An extensible, human-in-the-loop email automation system with Telegram as its
-first interface. Phase 3B adds encrypted, per-Telegram-user bring-your-own-key
-AI configuration. Users can still enter an email manually without any AI
-credential. Both creation paths produce the same immutable `EmailDraft`, then
-reuse the same preview, editing, approval, cancellation, and simulated-send
-lifecycle.
+first interface. Phase 4 adds grounded job-application email preparation using
+a locally configured candidate profile and CV. General and job-application
+emails can still be entered manually without any AI credential. Every path
+produces the same immutable `EmailDraft` and reuses the preview, editing,
+approval, cancellation, duplicate-send protection, and simulated-send lifecycle.
 
 No real email is delivered in this phase.
 
@@ -14,6 +14,7 @@ No real email is delivered in this phase.
 - `/start` — introduction
 - `/help` — command list
 - `/send` — create and review a general email draft
+- `/apply` — prepare and review a job application email with a CV
 - `/configure_ai` — configure or safely replace your AI provider credential
 - `/ai_status` — show your AI availability without exposing credentials
 - `/remove_ai` — remove your saved AI configuration after confirmation
@@ -22,6 +23,86 @@ No real email is delivered in this phase.
 Invalid input stays in the current state, explains the problem, and asks again.
 Temporary data is stored under a workflow-specific key in Telegram `user_data`
 and removed on completion or cancellation.
+
+## Phase 4: Job applications and CV preparation
+
+`/apply` starts a separate explicit state machine while reusing the existing
+approval workflow:
+
+```text
+/apply
+  ↓
+Validate configured candidate profile + CV
+  ↓
+Company email → Company name → Role → Job description
+  ↓
+Choose draft method
+  ├── Manual → Subject → Body ───────────────────────┐
+  └── AI → Availability → Tone → Grounded generate ─┤
+                                                     ↓
+                                            PreparedEmail
+                                       EmailDraft + CV metadata
+                                                     ↓
+                                      Preview / Edit / Regenerate
+                                                     ↓
+                                           Confirm → Mock Send
+```
+
+Manual mode never invokes a generator. AI mode uses the same per-user provider
+resolution as general email generation, but a specialized job-application
+generator receives the candidate profile, extracted requirements, and explicit
+match result. Regenerate is shown only for AI drafts.
+
+The deterministic requirement extractor recognizes a deliberately small,
+explicit technology catalogue. The matcher compares those requirements only
+with skills stated in the profile, project technologies, or experience skills.
+It produces separate matched and unmatched collections; unsupported job
+requirements are never converted into candidate qualifications.
+
+AI prompt construction treats the job description and profile as untrusted
+data and instructs the provider to use only grounded candidate facts. Provider
+output is schema-validated. A conservative semantic guard rejects a generated
+subject or body that mentions an unmatched skill and uses the truthful
+deterministic fallback instead. This is an additional safety boundary, not a
+claim that automated verification can replace human review.
+
+Job-specific editing keeps these distinctions clear:
+
+- Recipient, subject, and body edits update only the corresponding draft value.
+- Company, role, and job-description edits update application metadata and
+  recompute requirement matching without silently overwriting edited email text.
+- An AI user can explicitly choose Regenerate after changing metadata.
+- CV attachment metadata is preserved through editing and regeneration.
+
+`EmailAttachment` stores validated path, filename, MIME type, and size without
+loading file content into the session. `PreparedEmail` bundles that metadata
+with the shared `EmailDraft`. In Phase 4, `MockEmailSender` receives the prepared
+attachment path but does not contact Gmail or transmit a file externally.
+
+The Phase 4 dependency direction is:
+
+```text
+Telegram /apply handler
+          ↓
+JobApplicationWorkflow
+  ├── CandidateProfileService → local JSON
+  ├── CVAttachmentService → local PDF/DOC/DOCX metadata
+  ├── RequirementExtractor + CandidateRequirementMatcher
+  ├── JobApplicationEmailGenerator
+  │      ├── optional LLMProvider
+  │      └── truthful deterministic fallback
+  └── GeneralEmailWorkflow
+             ↓
+       EmailSender protocol
+             ↓
+       MockEmailSender
+```
+
+The candidate profile and job application session are immutable domain values.
+Edits create replacement snapshots with `dataclasses.replace`; no mutable draft
+subtype is needed. `JobApplicationWorkflow` owns job-specific preparation while
+`GeneralEmailWorkflow` remains the single owner of approval, sender failure
+recovery, and in-memory duplicate-confirmation claims.
 
 ## Phase 3B: Bring Your Own AI Key
 
@@ -242,6 +323,14 @@ Telegram email handlers
 UserEmailGeneratorResolver
    ├── UserAIConfigurationService
    └── AIProviderFactory
+
+Telegram general/job handlers
+             ↓
+UserAIProviderResolver
+   ├── per-user encrypted configuration
+   └── optional application development configuration
+             ↓
+   General or job-specific AI generator
 ```
 
 ```text
@@ -314,6 +403,15 @@ main.py                     # Executable entry point
   working but non-production implementation. It can simulate success or failure
   and records requests for verification. “Mock” remains in its class name because
   its development purpose is immediately recognizable.
+- **Shared domain model:** manual general email, AI general email, manual job
+  application, and AI job application paths all converge on `EmailDraft`.
+- **Grounded generation:** `CandidateProfile` is the source of candidate facts;
+  explicit requirement matching and output checks prevent unmatched job skills
+  from being presented as qualifications.
+- **Prepared attachment boundary:** `PreparedEmail` adds typed attachment
+  metadata without coupling the email domain or application workflow to Gmail.
+- **Workflow composition:** job preparation delegates approval to the existing
+  `GeneralEmailWorkflow`, avoiding a second send/idempotency implementation.
 
 ### Duplicate-send protection
 
@@ -331,7 +429,8 @@ in-memory for Phase 2. Durable idempotency belongs with persistence and a real
 delivery provider in a later phase.
 
 Stale or unknown email callback data is answered safely. If workflow state has
-already been cleared, the user is told to start again with `/send`.
+already been cleared, the user is told to start again with `/send` or `/apply`,
+depending on the callback family.
 
 ## Phase 3 AI generation
 
@@ -376,6 +475,8 @@ AI_MODEL=gpt-4o-mini
 AI_TIMEOUT_SECONDS=30
 CREDENTIAL_ENCRYPTION_KEY=
 DATABASE_PATH=data/email_assistant.db
+CANDIDATE_PROFILE_PATH=data/candidate_profile.json
+CV_FILE_PATH=attachments/CV.pdf
 ```
 
 - A user's encrypted configuration has first priority.
@@ -400,13 +501,29 @@ unreadable. If the key is absent or invalid, startup and manual drafting still
 work, while `/configure_ai` explains that secure credential storage is
 unavailable.
 
+Job applications require local profile and CV files even when drafting is
+manual. Copy and edit the committed placeholder profile:
+
+```bash
+cp data/candidate_profile.example.json data/candidate_profile.json
+mkdir -p attachments
+cp /path/to/your/CV.pdf attachments/CV.pdf
+```
+
+`candidate_profile.json` and files under `attachments/` are ignored by Git.
+Supported CV extensions are `.pdf`, `.doc`, and `.docx`; the configured file
+must exist, be readable, and be non-empty. The example profile contains only
+placeholders—replace every value with accurate candidate facts before using
+`/apply`. The current local-file design represents one deployment profile; it
+does not yet provide per-user candidate-profile persistence.
+
 Then run:
 
 ```bash
 python main.py
 ```
 
-Open the bot in Telegram, send `/start`, then `/send`. Even after confirmation,
+Open the bot in Telegram and use `/send` or `/apply`. Even after confirmation,
 the configured sender only simulates delivery.
 
 ## Test
@@ -420,20 +537,25 @@ invalid replacement, temporary provider failure, missing encryption setup,
 status secrecy, removal confirmation/cancellation, multi-user isolation,
 user-specific provider resolution, manual/AI selection, both complete Phase 3B
 smoke flows, deterministic fallback, approval, editing, stale callbacks, and AI
-output validation. They do not contact Telegram, Gmail, or a real AI provider.
+output validation. Phase 4 tests additionally cover profile and CV validation,
+requirement extraction/matching, unsupported-skill rejection, immutable job
+edits, attachment preservation, retry/duplicate behavior, AI-unavailable manual
+fallback, and complete manual and fake-AI `/apply` smoke flows. They do not
+contact Telegram, Gmail, or a real AI provider.
 
 ## Why Gmail is absent
 
-Phase 3B adds credential configuration without changing the proven approval lifecycle.
-Keeping delivery simulated isolates state-machine, editing, idempotency, and
-failure-recovery behavior while all sends remain harmless. Gmail API and OAuth
-belong to a later phase.
+Phase 4 prepares a validated CV attachment and exercises the entire application
+lifecycle without changing the proven approval contract. Keeping delivery
+simulated isolates truthful generation, state-machine, editing, idempotency,
+attachment preparation, and failure-recovery behavior while all sends remain
+harmless. Gmail API, OAuth, and real attachment upload belong to a later phase.
 
 ## Current checkpoint
 
-Phase 3B is implemented with encrypted per-user OpenAI configuration, optional
-application-level development fallback, and manual drafting. SQLite is used only
-for encrypted AI configuration. Gemini and Claude may be used externally and
-pasted through manual mode, but are not integrated. Gmail, OAuth, attachments,
-job applications, subscriptions, billing, scheduling, and real delivery remain
+Phase 4 is implemented with manual and optional-AI job application drafting,
+grounded candidate facts, deterministic requirement matching, and validated CV
+attachment preparation. SQLite remains limited to encrypted AI configuration;
+job application history and candidate profiles are not persisted there. Gmail,
+OAuth, subscriptions, billing, scheduling, and real delivery remain
 intentionally absent. `MockEmailSender` is still the only sender.

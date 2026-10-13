@@ -153,6 +153,7 @@ def build_general_email_callbacks(
 
     async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data.pop("ai_configuration", None)
+        context.user_data.pop("job_application", None)
         context.user_data[WORKFLOW_KEY] = {}
         LOGGER.info("General email workflow started")
         if update.effective_message:

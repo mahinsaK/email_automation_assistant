@@ -21,7 +21,7 @@ from app.bot.keyboards import (
     DRAFT_AI,
     TONE_CALLBACK_PREFIX,
 )
-from app.bot.states import GeneralEmailState
+from app.bot.states import GeneralEmailState, JobApplicationState
 from app.models.ai_configuration import AIProviderType
 from app.models.email import EmailDraft, SendResult
 from app.repositories.ai_configuration import SQLiteAIConfigurationRepository
@@ -248,6 +248,43 @@ def test_configuration_from_send_preserves_recipient_and_returns_to_method(
     assert begin_state is GeneralEmailState.AI_CONFIG_PROVIDER
     assert final_state is GeneralEmailState.WAITING_DRAFT_METHOD
     assert context.user_data["general_email"]["recipient"] == "person@example.com"
+
+
+def test_configuration_from_apply_preserves_job_data_and_returns_to_method(
+    tmp_path: Path,
+) -> None:
+    service, _ = make_service(tmp_path)
+    callbacks = build_ai_configuration_callbacks(service)
+    context = SimpleNamespace(
+        user_data={
+            "job_application": {
+                "company_email": "jobs@example.com",
+                "company_name": "Example Co",
+                "role": "Engineer",
+                "job_description": "Python required",
+            }
+        }
+    )
+
+    begin_state = asyncio.run(
+        callbacks.begin_from_job(
+            make_callback_update("job:ai:configure", 101),
+            context,
+        )
+    )
+    asyncio.run(
+        callbacks.handle_provider(
+            make_callback_update(AI_CONFIG_OPENAI, 101),
+            context,
+        )
+    )
+    final_state = asyncio.run(
+        callbacks.receive_api_key(make_text_update("sk-job-user", 101), context)
+    )
+
+    assert begin_state is GeneralEmailState.AI_CONFIG_PROVIDER
+    assert final_state is JobApplicationState.WAITING_DRAFT_METHOD
+    assert context.user_data["job_application"]["role"] == "Engineer"
 
 
 def test_invalid_and_temporary_validation_messages_are_distinct(tmp_path: Path) -> None:
