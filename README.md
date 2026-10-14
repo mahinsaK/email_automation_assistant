@@ -46,9 +46,11 @@ gmail_connections row keyed by Telegram user ID
 ```
 
 The state value is cryptographically random and contains no user ID or secret.
-It is bound to the initiating Telegram user in server memory, expires after ten
-minutes by default, and is consumed once. This is suitable for one process. A
-multi-instance production deployment would need shared temporary state storage.
+It is bound to the initiating Telegram user and the OAuth PKCE verifier in
+server memory, expires after ten minutes by default, and is consumed once. The
+same verifier is used for authorization and token exchange. This is suitable
+for one process. A multi-instance production deployment would need shared
+temporary state storage.
 
 Authorization and delivery are deliberately separate:
 

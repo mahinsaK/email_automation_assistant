@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from typing import Protocol
 
 from app.models.gmail_connection import GmailConnectionInfo, GoogleOAuthGrant
@@ -25,9 +26,14 @@ class GoogleOAuthError(RuntimeError):
 
 
 class GoogleOAuthGateway(Protocol):
-    def authorization_url(self, *, state: str) -> str: ...
+    def authorization_url(self, *, state: str, code_verifier: str) -> str: ...
 
-    async def exchange_code(self, *, code: str) -> GoogleOAuthGrant: ...
+    async def exchange_code(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+    ) -> GoogleOAuthGrant: ...
 
 
 class GoogleOAuthLibraryGateway:
@@ -46,8 +52,8 @@ class GoogleOAuthLibraryGateway:
         self._redirect_uri = redirect_uri
         self._scopes = scopes
 
-    def authorization_url(self, *, state: str) -> str:
-        flow = self._new_flow(state=state)
+    def authorization_url(self, *, state: str, code_verifier: str) -> str:
+        flow = self._new_flow(state=state, code_verifier=code_verifier)
         authorization_url, _ = flow.authorization_url(
             access_type="offline",
             include_granted_scopes="true",
@@ -55,19 +61,32 @@ class GoogleOAuthLibraryGateway:
         )
         return str(authorization_url)
 
-    async def exchange_code(self, *, code: str) -> GoogleOAuthGrant:
+    async def exchange_code(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+    ) -> GoogleOAuthGrant:
         if not code:
             raise GoogleOAuthError("Google authorization code is missing.")
         try:
-            return await asyncio.to_thread(self._exchange_code_sync, code)
+            return await asyncio.to_thread(
+                self._exchange_code_sync,
+                code,
+                code_verifier,
+            )
         except GoogleOAuthError:
             raise
         except Exception as error:
             LOGGER.warning("Google OAuth code exchange failed: %s", type(error).__name__)
             raise GoogleOAuthError("Google authorization could not be completed.") from error
 
-    def _exchange_code_sync(self, code: str) -> GoogleOAuthGrant:
-        flow = self._new_flow()
+    def _exchange_code_sync(
+        self,
+        code: str,
+        code_verifier: str,
+    ) -> GoogleOAuthGrant:
+        flow = self._new_flow(code_verifier=code_verifier)
         flow.fetch_token(code=code)
         credentials = flow.credentials
         refresh_token = credentials.refresh_token
@@ -93,7 +112,12 @@ class GoogleOAuthLibraryGateway:
             scopes=granted_scopes,
         )
 
-    def _new_flow(self, *, state: str | None = None):
+    def _new_flow(
+        self,
+        *,
+        state: str | None = None,
+        code_verifier: str,
+    ):
         try:
             from google_auth_oauthlib.flow import Flow
         except ImportError as error:
@@ -111,6 +135,8 @@ class GoogleOAuthLibraryGateway:
             client_config,
             scopes=list(self._scopes),
             state=state,
+            code_verifier=code_verifier,
+            autogenerate_code_verifier=False,
         )
         flow.redirect_uri = self._redirect_uri
         return flow
@@ -131,9 +157,16 @@ class GmailOAuthService:
         self._connection_service = connection_service
 
     def begin(self, telegram_user_id: int) -> str:
-        state = self._state_store.create(telegram_user_id)
+        code_verifier = secrets.token_urlsafe(64)
+        state = self._state_store.create(
+            telegram_user_id,
+            code_verifier=code_verifier,
+        )
         LOGGER.info("Gmail OAuth connection started")
-        return self._gateway.authorization_url(state=state)
+        return self._gateway.authorization_url(
+            state=state,
+            code_verifier=code_verifier,
+        )
 
     def cancel(self, state: str) -> None:
         """Consume a denied authorization state so it cannot be replayed."""
@@ -149,11 +182,17 @@ class GmailOAuthService:
         """Consume state before exchange, preventing replay on any outcome."""
 
         try:
-            telegram_user_id = self._state_store.consume(state)
+            pending = self._state_store.consume(state)
         except OAuthStateError:
             LOGGER.warning("Invalid or expired Gmail OAuth state received")
             raise
-        grant = await self._gateway.exchange_code(code=code)
-        info = await self._connection_service.save_grant(telegram_user_id, grant)
+        grant = await self._gateway.exchange_code(
+            code=code,
+            code_verifier=pending.code_verifier,
+        )
+        info = await self._connection_service.save_grant(
+            pending.telegram_user_id,
+            grant,
+        )
         LOGGER.info("Gmail OAuth connection completed")
         return info

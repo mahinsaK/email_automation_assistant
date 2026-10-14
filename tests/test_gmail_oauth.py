@@ -1,6 +1,8 @@
 """Network-free tests for Gmail OAuth state, encryption, and persistence."""
 
 import asyncio
+import base64
+import hashlib
 import logging
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -27,12 +29,21 @@ class FakeOAuthGateway:
         self.grant = grant
         self.fail = False
         self.codes: list[str] = []
+        self.authorization_verifiers: dict[str, str] = {}
+        self.exchange_verifiers: list[str] = []
 
-    def authorization_url(self, *, state: str) -> str:
+    def authorization_url(self, *, state: str, code_verifier: str) -> str:
+        self.authorization_verifiers[state] = code_verifier
         return f"https://accounts.example/authorize?state={state}"
 
-    async def exchange_code(self, *, code: str) -> GoogleOAuthGrant:
+    async def exchange_code(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+    ) -> GoogleOAuthGrant:
         self.codes.append(code)
+        self.exchange_verifiers.append(code_verifier)
         if self.fail:
             raise GoogleOAuthError("exchange failed")
         return self.grant
@@ -62,8 +73,15 @@ def test_google_authorization_url_contains_redirect_scope_and_state() -> None:
         ),
     )
 
-    url = gateway.authorization_url(state="opaque-state")
+    code_verifier = "pkce-verifier-" + ("a" * 50)
+    url = gateway.authorization_url(
+        state="opaque-state",
+        code_verifier=code_verifier,
+    )
     query = parse_qs(urlparse(url).query)
+    expected_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode("ascii")).digest()
+    ).decode("ascii").rstrip("=")
 
     assert query["redirect_uri"] == [
         "http://localhost:8000/oauth/google/callback"
@@ -71,6 +89,9 @@ def test_google_authorization_url_contains_redirect_scope_and_state() -> None:
     assert query["state"] == ["opaque-state"]
     assert GMAIL_SEND_SCOPE in query["scope"][0].split()
     assert query["access_type"] == ["offline"]
+    assert query["code_challenge"] == [expected_challenge]
+    assert query["code_challenge_method"] == ["S256"]
+    assert gateway._new_flow(code_verifier=code_verifier).code_verifier == code_verifier
 
 
 def test_oauth_success_binds_user_and_encrypts_refresh_token(
@@ -100,6 +121,7 @@ def test_oauth_success_binds_user_and_encrypts_refresh_token(
     database_bytes = (tmp_path / "assistant.db").read_bytes()
 
     assert result.google_email == "user@gmail.com"
+    assert gateway.exchange_verifiers == [gateway.authorization_verifiers[state]]
     assert stored is not None
     assert stored.telegram_user_id == 101
     assert stored.encrypted_refresh_token != refresh_token
