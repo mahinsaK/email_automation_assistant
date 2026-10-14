@@ -9,6 +9,12 @@ class InputValidationError(ValueError):
     """Raised when user-supplied workflow input is invalid."""
 
 
+MAX_PURPOSE_LENGTH = 200
+MAX_CONTEXT_LENGTH = 4000
+MAX_SUBJECT_LENGTH = 200
+MAX_BODY_LENGTH = 10_000
+
+
 _EMAIL_PATTERN = re.compile(
     r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"

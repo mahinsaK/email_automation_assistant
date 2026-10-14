@@ -6,12 +6,13 @@ import pytest
 
 from app.models.email import EmailDraft
 from app.services.email_generator import DeterministicEmailGenerator
+from app.services.email_sender import MockEmailSender
 from app.services.validation import InputValidationError
 from app.workflows.general_email import GeneralEmailRequest, GeneralEmailWorkflow
 
 
 def test_workflow_generates_a_deterministic_draft() -> None:
-    workflow = GeneralEmailWorkflow(DeterministicEmailGenerator())
+    workflow = GeneralEmailWorkflow(DeterministicEmailGenerator(), MockEmailSender())
 
     draft = asyncio.run(
         workflow.create_draft(
@@ -30,7 +31,7 @@ def test_workflow_generates_a_deterministic_draft() -> None:
 
 
 def test_workflow_rejects_invalid_input_before_generation() -> None:
-    workflow = GeneralEmailWorkflow(DeterministicEmailGenerator())
+    workflow = GeneralEmailWorkflow(DeterministicEmailGenerator(), MockEmailSender())
 
     with pytest.raises(InputValidationError):
         asyncio.run(
@@ -53,12 +54,13 @@ class FakeGenerator:
         recipient: str,
         purpose: str,
         context: str,
+        tone: str = "Professional",
     ) -> EmailDraft:
         return EmailDraft(recipient=recipient, subject="Fake", body=context)
 
 
 def test_workflow_accepts_an_injected_generator() -> None:
-    workflow = GeneralEmailWorkflow(FakeGenerator())
+    workflow = GeneralEmailWorkflow(FakeGenerator(), MockEmailSender())
 
     draft = asyncio.run(
         workflow.create_draft(

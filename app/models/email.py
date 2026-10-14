@@ -12,6 +12,28 @@ class EmailStatus(StrEnum):
 
     DRAFT = "draft"
     PREVIEWED = "previewed"
+    SENDING = "sending"
+    SENT = "sent"
+
+
+class EmailTone(StrEnum):
+    """Supported drafting tones shared by all generator strategies."""
+
+    PROFESSIONAL = "Professional"
+    CONCISE = "Concise"
+    FRIENDLY = "Friendly"
+    FORMAL = "Formal"
+
+
+@dataclass(frozen=True, slots=True)
+class SendResult:
+    """Provider-independent result returned by an email sender."""
+
+    success: bool
+    message_id: str | None = None
+    error: str | None = None
+    thread_id: str | None = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
