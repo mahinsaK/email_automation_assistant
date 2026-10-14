@@ -18,6 +18,12 @@ from app.models.job_application import (
     Project,
     RequirementMatchResult,
 )
+from app.models.gmail_connection import (
+    GmailConnection,
+    GmailConnectionInfo,
+    GoogleOAuthGrant,
+    ResolvedGmailCredential,
+)
 
 __all__ = [
     "AIProviderType",
@@ -29,12 +35,16 @@ __all__ = [
     "EmailStatus",
     "EmailTone",
     "Experience",
+    "GmailConnection",
+    "GmailConnectionInfo",
+    "GoogleOAuthGrant",
     "JobApplicationRequest",
     "JobRequirements",
     "PreparedEmail",
     "Project",
     "RequirementMatchResult",
     "ResolvedAIConfiguration",
+    "ResolvedGmailCredential",
     "SendResult",
     "StoredAIConfiguration",
 ]

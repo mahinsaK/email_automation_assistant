@@ -18,7 +18,7 @@ EDIT_BODY = "email:edit:body"
 EDIT_CONTEXT = "email:edit:context"
 BACK_TO_PREVIEW = "email:edit:back"
 
-ACTION_PATTERN = r"^email:(confirm|edit|regenerate|cancel)$"
+ACTION_PATTERN = r"^email:(confirm|edit|regenerate|cancel|gmail:back)$"
 EDIT_PATTERN = r"^email:edit:(recipient|subject|body|context|back)$"
 EMAIL_CALLBACK_PATTERN = r"^email:"
 
@@ -69,7 +69,7 @@ JOB_CONFIRM = "job:confirm"
 JOB_EDIT = "job:edit"
 JOB_REGENERATE = "job:regenerate"
 JOB_CANCEL = "job:cancel"
-JOB_ACTION_PATTERN = r"^job:(confirm|edit|regenerate|cancel)$"
+JOB_ACTION_PATTERN = r"^job:(confirm|edit|regenerate|cancel|gmail:back)$"
 
 JOB_EDIT_RECIPIENT = "job:edit:recipient"
 JOB_EDIT_COMPANY = "job:edit:company"
@@ -82,6 +82,16 @@ JOB_EDIT_PATTERN = (
     r"^job:edit:(recipient|company|role|description|subject|body|back)$"
 )
 JOB_CALLBACK_PATTERN = r"^job:"
+
+EMAIL_GMAIL_BACK = "email:gmail:back"
+JOB_GMAIL_BACK = "job:gmail:back"
+
+GMAIL_CONNECT_RECONNECT = "gmail_connect:reconnect"
+GMAIL_CONNECT_CANCEL = "gmail_connect:cancel"
+GMAIL_CONNECT_CALLBACK_PATTERN = r"^gmail_connect:(reconnect|cancel)$"
+GMAIL_DISCONNECT_CONFIRM = "gmail_disconnect:confirm"
+GMAIL_DISCONNECT_KEEP = "gmail_disconnect:keep"
+GMAIL_DISCONNECT_CALLBACK_PATTERN = r"^gmail_disconnect:(confirm|keep)$"
 
 TONE_CALLBACK_PREFIX = "email:tone:"
 TONE_PATTERN = r"^email:tone:(professional|concise|friendly|formal)$"
@@ -168,6 +178,92 @@ def ai_remove_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("❌ Keep", callback_data=AI_REMOVE_KEEP)],
         ]
     )
+
+
+def gmail_authorization_keyboard(authorization_url: str) -> InlineKeyboardMarkup:
+    """Open Google's authorization page without putting tokens in Telegram."""
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Connect Gmail", url=authorization_url)]]
+    )
+
+
+def gmail_reconnect_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Reconnect",
+                    callback_data=GMAIL_CONNECT_RECONNECT,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Cancel",
+                    callback_data=GMAIL_CONNECT_CANCEL,
+                )
+            ],
+        ]
+    )
+
+
+def gmail_disconnect_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Disconnect",
+                    callback_data=GMAIL_DISCONNECT_CONFIRM,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Keep Connected",
+                    callback_data=GMAIL_DISCONNECT_KEEP,
+                )
+            ],
+        ]
+    )
+
+
+def email_gmail_required_keyboard(
+    authorization_url: str | None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if authorization_url:
+        rows.append([InlineKeyboardButton("Connect Gmail", url=authorization_url)])
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "Back to Preview",
+                    callback_data=EMAIL_GMAIL_BACK,
+                )
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data=CANCEL)],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def job_gmail_required_keyboard(
+    authorization_url: str | None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if authorization_url:
+        rows.append([InlineKeyboardButton("Connect Gmail", url=authorization_url)])
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "Back to Preview",
+                    callback_data=JOB_GMAIL_BACK,
+                )
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data=JOB_CANCEL)],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def tone_keyboard() -> InlineKeyboardMarkup:

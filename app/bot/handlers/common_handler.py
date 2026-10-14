@@ -13,8 +13,8 @@ WELCOME_TEXT = (
     "Welcome to AI Email Automation Assistant.\n\n"
     "I can help you enter a draft manually or create one with configured AI, "
     "then edit and approve it. I can also prepare grounded job application "
-    "emails with your configured CV. "
-    "Email delivery is still simulated; no real email is sent.\n\n"
+    "emails with your configured CV. Approved emails can be delivered only "
+    "through your explicitly connected Gmail account.\n\n"
     "Use /send for a general email, /apply for a job application, or /help."
 )
 
@@ -27,6 +27,9 @@ HELP_TEXT = (
     "/configure_ai - Configure or replace your AI provider credential\n"
     "/ai_status - Show your AI configuration status\n"
     "/remove_ai - Remove your saved AI configuration\n"
+    "/connect_gmail - Connect Gmail securely using Google OAuth\n"
+    "/gmail_status - Show whether Gmail is connected\n"
+    "/disconnect_gmail - Remove your saved Gmail authorization\n"
     "/cancel - Cancel the active workflow"
 )
 

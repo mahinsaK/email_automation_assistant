@@ -24,11 +24,13 @@ from app.bot.keyboards import (
     EDIT_CONTEXT,
     EDIT_RECIPIENT,
     EDIT_SUBJECT,
+    EMAIL_GMAIL_BACK,
     REGENERATE,
     TONE_CALLBACKS,
     ai_unavailable_keyboard,
     draft_method_keyboard,
     edit_menu_keyboard,
+    email_gmail_required_keyboard,
     preview_actions_keyboard,
     tone_keyboard,
 )
@@ -43,8 +45,14 @@ from app.services.validation import (
     validate_text,
 )
 from app.services.email_generator import EmailGenerator
+from app.services.gmail.client import GmailClientError
+from app.services.gmail_connection import (
+    GmailAuthorizationError,
+    GmailConnectionError,
+)
 from app.services.ai_configuration import AIConfigurationError
 from app.services.user_email_generator import UserEmailGeneratorResolver
+from app.services.user_email_sender import UserEmailSenderResolver
 from app.workflows.general_email import (
     DraftMode,
     GeneralEmailRequest,
@@ -58,6 +66,7 @@ WORKFLOW_KEY = "general_email"
 STALE_MESSAGE = "This email draft is no longer active. Use /send to start a new email."
 
 Callback = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[int | None]]
+AuthorizationURL = Callable[[int], Awaitable[str | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +136,8 @@ def build_general_email_callbacks(
     workflow: GeneralEmailWorkflow,
     *,
     generator_resolver: UserEmailGeneratorResolver | None = None,
+    sender_resolver: UserEmailSenderResolver | None = None,
+    gmail_authorization_url: AuthorizationURL | None = None,
     start_ai_configuration: Callback | None = None,
 ) -> GeneralEmailCallbacks:
     """Create Telegram callbacks with application workflow dependencies injected."""
@@ -150,6 +161,30 @@ def build_general_email_callbacks(
         if user is None:
             return None
         return await generator_resolver.resolve(user.id)
+
+    async def _offer_gmail_connection(
+        update: Update,
+        *,
+        invalid: bool = False,
+    ) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if message is None:
+            return
+        authorization_url = None
+        if user is not None and gmail_authorization_url is not None:
+            authorization_url = await gmail_authorization_url(user.id)
+        text = (
+            "⚠️ Your Gmail connection is no longer valid.\n\n"
+            "Reconnect Gmail before sending. Your email draft has been kept."
+            if invalid
+            else "📧 Gmail is not connected.\n\n"
+            "Connect Gmail before sending. Your email draft has been kept."
+        )
+        await message.reply_text(
+            text,
+            reply_markup=email_gmail_required_keyboard(authorization_url),
+        )
 
     async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data.pop("ai_configuration", None)
@@ -462,7 +497,27 @@ def build_general_email_callbacks(
             return await _show_stale(query.message)
 
         if query.data == CONFIRM:
-            outcome = await workflow.approve(session)
+            sender = None
+            if sender_resolver is not None:
+                user = update.effective_user
+                if user is None:
+                    return await _show_stale(query.message)
+                try:
+                    sender = await sender_resolver.resolve(user.id)
+                except GmailAuthorizationError:
+                    await _offer_gmail_connection(update, invalid=True)
+                    return GeneralEmailState.WAITING_FOR_ACTION
+                except (GmailConnectionError, GmailClientError):
+                    LOGGER.warning("Gmail sender could not be resolved")
+                    await query.message.reply_text(
+                        "⚠️ Gmail is temporarily unavailable. Your draft was kept."
+                    )
+                    return GeneralEmailState.WAITING_FOR_ACTION
+                if sender is None:
+                    await _offer_gmail_connection(update)
+                    return GeneralEmailState.WAITING_FOR_ACTION
+
+            outcome = await workflow.approve(session, sender=sender)
             if outcome.duplicate:
                 await query.message.reply_text(
                     "This draft is already being processed. It was not submitted twice."
@@ -473,20 +528,37 @@ def build_general_email_callbacks(
             if outcome.result.success:
                 await query.edit_message_reply_markup(reply_markup=None)
                 context.user_data.pop(WORKFLOW_KEY, None)
-                await query.message.reply_text(
-                    "✅ Email approved and mock-send completed successfully.\n\n"
-                    f"To:\n{outcome.session.draft.recipient}\n\n"
-                    f"Subject:\n{outcome.session.draft.subject}\n\n"
-                    "Real Gmail delivery is not enabled yet."
-                )
+                if sender_resolver is None:
+                    success_text = (
+                        "✅ Email approved and mock-send completed successfully.\n\n"
+                        f"To:\n{outcome.session.draft.recipient}\n\n"
+                        f"Subject:\n{outcome.session.draft.subject}\n\n"
+                        "Real Gmail delivery is not enabled in this test setup."
+                    )
+                else:
+                    success_text = (
+                        "✅ Email sent successfully.\n\n"
+                        f"To:\n{outcome.session.draft.recipient}\n\n"
+                        f"Subject:\n{outcome.session.draft.subject}"
+                    )
+                await query.message.reply_text(success_text)
                 return ConversationHandler.END
 
             await query.edit_message_reply_markup(reply_markup=None)
+            if outcome.result.error_code == "gmail_authorization_invalid":
+                await _offer_gmail_connection(update, invalid=True)
+                await _show_preview(query.message, outcome.session)
+                return GeneralEmailState.WAITING_FOR_ACTION
             await query.message.reply_text(
-                "⚠️ The mock email send could not be completed.\n\n"
-                "No real email was delivered. You can try again or cancel."
+                "⚠️ The email could not be sent.\n\n"
+                "The draft was kept. You can try again or cancel."
             )
             await _show_preview(query.message, outcome.session)
+            return GeneralEmailState.WAITING_FOR_ACTION
+
+        if query.data == EMAIL_GMAIL_BACK:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await _show_preview(query.message, session)
             return GeneralEmailState.WAITING_FOR_ACTION
 
         if query.data == REGENERATE:

@@ -1,13 +1,10 @@
 # AI Email Automation Assistant
 
 An extensible, human-in-the-loop email automation system with Telegram as its
-first interface. Phase 4 adds grounded job-application email preparation using
-a locally configured candidate profile and CV. General and job-application
-emails can still be entered manually without any AI credential. Every path
-produces the same immutable `EmailDraft` and reuses the preview, editing,
-approval, cancellation, duplicate-send protection, and simulated-send lifecycle.
-
-No real email is delivered in this phase.
+first interface. Phase 5 adds per-user Gmail delivery through Google OAuth 2.0.
+General and job-application emails still converge on the same immutable
+`EmailDraft`, preview, editing, explicit approval, failure recovery, and
+duplicate-send protection. Gmail is invoked only after Confirm is pressed.
 
 ## Commands
 
@@ -18,11 +15,83 @@ No real email is delivered in this phase.
 - `/configure_ai` — configure or safely replace your AI provider credential
 - `/ai_status` — show your AI availability without exposing credentials
 - `/remove_ai` — remove your saved AI configuration after confirmation
+- `/connect_gmail` — connect Gmail securely through Google OAuth
+- `/gmail_status` — show the requesting user's Gmail connection status
+- `/disconnect_gmail` — remove the requesting user's saved Gmail authorization
 - `/cancel` — discard the active workflow
 
 Invalid input stays in the current state, explains the problem, and asks again.
 Temporary data is stored under a workflow-specific key in Telegram `user_data`
 and removed on completion or cancellation.
+
+## Phase 5: Gmail OAuth and real delivery
+
+Each Telegram user connects a separate Google account. Gmail passwords are
+never requested or handled:
+
+```text
+/connect_gmail
+      ↓
+Opaque, one-time state stored in memory with an expiry
+      ↓
+Google authorization page in the browser
+      ↓
+GET /oauth/google/callback
+      ↓
+Verify and consume state → exchange authorization code
+      ↓
+Encrypt refresh token with CredentialCipher
+      ↓
+gmail_connections row keyed by Telegram user ID
+```
+
+The state value is cryptographically random and contains no user ID or secret.
+It is bound to the initiating Telegram user in server memory, expires after ten
+minutes by default, and is consumed once. This is suitable for one process. A
+multi-instance production deployment would need shared temporary state storage.
+
+Authorization and delivery are deliberately separate:
+
+- `GmailOAuthService` obtains user consent, validates state, exchanges the code,
+  and saves the encrypted refresh token.
+- `GmailEmailSender` receives an already-approved `EmailDraft`, builds MIME, and
+  adapts Gmail's `users.messages.send` API to the existing `EmailSender` port.
+
+At Confirm time, the authenticated Telegram user ID is passed to
+`UserEmailSenderResolver`. It loads only that user's connection, decrypts the
+refresh token briefly, refreshes access, and constructs an isolated sender. The
+Telegram ID is not added to `EmailDraft`.
+
+```text
+Telegram user presses Confirm
+              ↓
+GeneralEmailWorkflow approval claim (PREVIEWED → SENDING)
+              ↓
+UserEmailSenderResolver
+   ├── UserGmailConnectionService
+   ├── encrypted SQLite connection
+   └── GmailClientFactory (refresh access token)
+              ↓
+GmailEmailSender → MIME builder → Gmail API
+              ↓
+      success: SENT / failure: PREVIEWED
+```
+
+The only Gmail permission requested is `gmail.send`. The OAuth request also
+uses the standard `openid` and `userinfo.email` identity scopes so the bot can
+show which account is connected. It does not request mailbox read, modify,
+delete, label, or settings permissions.
+
+General messages are plain-text MIME emails. Job applications use the same
+builder, which creates a multipart message and includes the configured CV with
+its filename and detected MIME type. Missing or unreadable attachments fail
+safely before the Gmail send call.
+
+If Gmail is missing, expired, revoked, rate-limited, unavailable, or returns an
+invalid response, the draft remains available. The UI offers connection or
+reconnection and lets the user return to preview. A failed reconnection does not
+replace an existing connection. `MockEmailSender` remains available for unit
+tests, smoke tests, and controlled failure simulation.
 
 ## Phase 4: Job applications and CV preparation
 
@@ -45,7 +114,7 @@ Choose draft method
                                                      ↓
                                       Preview / Edit / Regenerate
                                                      ↓
-                                           Confirm → Mock Send
+                                           Confirm → Gmail or test fake
 ```
 
 Manual mode never invokes a generator. AI mode uses the same per-user provider
@@ -76,8 +145,8 @@ Job-specific editing keeps these distinctions clear:
 
 `EmailAttachment` stores validated path, filename, MIME type, and size without
 loading file content into the session. `PreparedEmail` bundles that metadata
-with the shared `EmailDraft`. In Phase 4, `MockEmailSender` receives the prepared
-attachment path but does not contact Gmail or transmit a file externally.
+with the shared `EmailDraft`. Phase 5's MIME adapter consumes the same validated
+attachment path when an approved application is sent.
 
 The Phase 4 dependency direction is:
 
@@ -94,8 +163,8 @@ JobApplicationWorkflow
   └── GeneralEmailWorkflow
              ↓
        EmailSender protocol
-             ↓
-       MockEmailSender
+          ├── GmailEmailSender
+          └── MockEmailSender (tests)
 ```
 
 The candidate profile and job application session are immutable domain values.
@@ -236,7 +305,7 @@ WAITING_FOR_ACTION
   │
   ├── CONFIRM
   │      ↓
-  │    Mock Send
+  │   Resolve user's Gmail sender
   │      ↓
   │     END
   │
@@ -303,9 +372,13 @@ Draft creation strategy
                                          ↓
                               GeneralEmailWorkflow
                                          ↓
-                                 EmailSender protocol
+                         UserEmailSenderResolver
                                          ↓
-                                   MockEmailSender
+                  per-user Gmail connection + client
+                                         ↓
+                                EmailSender protocol
+                              ├── GmailEmailSender
+                              └── MockEmailSender (tests)
 ```
 
 Phase 3B adds these application services alongside the email workflow:
@@ -331,6 +404,21 @@ UserAIProviderResolver
    └── optional application development configuration
              ↓
    General or job-specific AI generator
+
+Telegram Gmail handlers / HTTP callback
+             ↓
+GmailOAuthService
+   ├── one-time expiring OAuth state
+   ├── Google OAuth library adapter
+   ├── CredentialCipher
+   └── GmailConnectionRepository → SQLite
+
+Approved workflow
+             ↓
+UserEmailSenderResolver
+   ├── UserGmailConnectionService
+   ├── GmailClientFactory
+   └── GmailEmailSender → Gmail API
 ```
 
 ```text
@@ -360,7 +448,8 @@ main.py                     # Executable entry point
   and AI generation are two strategies for constructing the same domain value.
 - **Dependency injection:** `build_application` is the composition root. It wires
   the repository, cipher, validators, provider factory, per-user resolver, and
-  `MockEmailSender`, then injects application services into Telegram callbacks.
+  Gmail OAuth, per-user sender resolution, and `MockEmailSender` test doubles,
+  then injects application services into Telegram callbacks.
 - **Adapter pattern:** `OpenAIProvider` translates the external asynchronous
   Responses API into the internal `LLMProvider` interface.
 - **Boundary validation:** untrusted provider output must pass the strict
@@ -412,6 +501,23 @@ main.py                     # Executable entry point
   metadata without coupling the email domain or application workflow to Gmail.
 - **Workflow composition:** job preparation delegates approval to the existing
   `GeneralEmailWorkflow`, avoiding a second send/idempotency implementation.
+- **OAuth 2.0:** Google obtains consent and returns a scoped authorization code;
+  the application never sees or stores a Gmail password.
+- **Least privilege:** delivery requests `gmail.send`, plus identity-only scopes
+  needed to display the connected address. No mailbox read access is requested.
+- **Gmail repository:** `GmailConnectionRepository` isolates persistence from
+  OAuth and delivery. Every query, replacement, and deletion is keyed by the
+  authenticated Telegram user ID.
+- **Credential encryption:** only Fernet ciphertext is persisted for refresh
+  tokens. Client ID and secret remain deployment configuration; access tokens
+  are refreshed in memory and are not saved.
+- **Resolver pattern:** `UserEmailSenderResolver` selects the correct Gmail
+  sender at Confirm time without coupling Telegram identity to `EmailDraft`.
+- **Gmail adapter:** `GmailEmailSender` implements the existing `EmailSender`
+  protocol while translating MIME and Gmail API responses into `SendResult`.
+- **Authorization versus delivery:** OAuth establishes revocable permission;
+  the sender uses that permission only after the workflow records explicit
+  human approval.
 
 ### Duplicate-send protection
 
@@ -425,8 +531,8 @@ PREVIEWED → SENDING → SENT
 
 A failed send transitions back to `PREVIEWED`, releases the claim, retains the
 draft, and permits retry or cancellation. This protection is intentionally
-in-memory for Phase 2. Durable idempotency belongs with persistence and a real
-delivery provider in a later phase.
+in-memory. It prevents rapid duplicate confirmations in one process. Durable
+cross-process idempotency belongs in a later production persistence phase.
 
 Stale or unknown email callback data is answered safely. If workflow state has
 already been cleared, the user is told to start again with `/send` or `/apply`,
@@ -477,6 +583,13 @@ CREDENTIAL_ENCRYPTION_KEY=
 DATABASE_PATH=data/email_assistant.db
 CANDIDATE_PROFILE_PATH=data/candidate_profile.json
 CV_FILE_PATH=attachments/CV.pdf
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8000/oauth/google/callback
+GMAIL_OAUTH_SCOPES=openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/gmail.send
+OAUTH_CALLBACK_HOST=127.0.0.1
+OAUTH_CALLBACK_PORT=8000
+OAUTH_STATE_TTL_SECONDS=600
 ```
 
 - A user's encrypted configuration has first priority.
@@ -501,6 +614,45 @@ unreadable. If the key is absent or invalid, startup and manual drafting still
 work, while `/configure_ai` explains that secure credential storage is
 unavailable.
 
+### Google Cloud OAuth setup
+
+1. Create or select a project in the
+   [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable the Gmail API for that project.
+3. Configure the Google Auth Platform consent screen. During development it may
+   remain in **Testing**; add each Gmail account that will connect as a test user.
+4. Add only the Gmail send scope
+   `https://www.googleapis.com/auth/gmail.send`. The application also requests
+   `openid` and `userinfo.email` to identify the connected address.
+5. Create an OAuth client with application type **Web application**.
+6. Add the exact authorized redirect URI used in `.env`, for example
+   `http://localhost:8000/oauth/google/callback`.
+7. Copy the client ID and client secret into `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`. Never commit either value.
+8. Start the application and use `/connect_gmail`, open the one-time link, grant
+   access, return to Telegram, and verify with `/gmail_status`.
+
+The built-in callback server listens on `OAUTH_CALLBACK_HOST` and
+`OAUTH_CALLBACK_PORT`; its public browser address comes from
+`GOOGLE_OAUTH_REDIRECT_URI`. This keeps localhost out of the OAuth service and
+allows a later deployment to use an HTTPS domain. For local HTTP only, OAuthlib
+may require this development environment setting:
+
+```env
+OAUTHLIB_INSECURE_TRANSPORT=1
+```
+
+Never enable insecure transport for a deployed HTTPS callback. Google requires
+the redirect URI to match the OAuth client configuration exactly. The callback
+page intentionally shows only success/failure and directs the user back to
+Telegram; it never displays codes or tokens.
+
+Official references:
+
+- [Google web-server OAuth flow](https://developers.google.com/identity/protocols/oauth2/web-server)
+- [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)
+- [Create and send Gmail messages](https://developers.google.com/workspace/gmail/api/guides/sending)
+
 Job applications require local profile and CV files even when drafting is
 manual. Copy and edit the committed placeholder profile:
 
@@ -523,8 +675,20 @@ Then run:
 python main.py
 ```
 
-Open the bot in Telegram and use `/send` or `/apply`. Even after confirmation,
-the configured sender only simulates delivery.
+Open the bot in Telegram, connect Gmail, and use `/send` or `/apply`. Generation
+still never sends automatically: only Confirm can invoke Gmail.
+
+### Optional manual real-account smoke test
+
+Automated tests never send real mail. After configuring a test Google account,
+an operator can verify manually:
+
+```text
+/connect_gmail → browser consent → /gmail_status
+/send → manual draft → preview → Confirm → verify receiver inbox
+/apply → company details → manual/AI draft → preview → Confirm
+       → verify the configured CV arrived
+```
 
 ## Test
 
@@ -541,21 +705,26 @@ output validation. Phase 4 tests additionally cover profile and CV validation,
 requirement extraction/matching, unsupported-skill rejection, immutable job
 edits, attachment preservation, retry/duplicate behavior, AI-unavailable manual
 fallback, and complete manual and fake-AI `/apply` smoke flows. They do not
-contact Telegram, Gmail, or a real AI provider.
+contact Telegram, Gmail, or a real AI provider. Phase 5 adds network-free tests
+for authorization URL construction, state forgery/replay/expiry, encrypted
+refresh-token persistence, failed reconnect preservation, multi-user isolation,
+status secrecy, disconnect, access refresh, MIME headers and PDF attachment,
+sender resolution, revoked authorization, retryable failures, and duplicate
+confirmation.
 
-## Why Gmail is absent
+## Production limitations
 
-Phase 4 prepares a validated CV attachment and exercises the entire application
-lifecycle without changing the proven approval contract. Keeping delivery
-simulated isolates truthful generation, state-machine, editing, idempotency,
-attachment preparation, and failure-recovery behavior while all sends remain
-harmless. Gmail API, OAuth, and real attachment upload belong to a later phase.
+Phase 5 uses SQLite for encrypted AI and Gmail connection records and in-memory
+OAuth state and duplicate-send claims. That is appropriate for one process or a
+demonstration. A production multi-instance deployment should later move durable
+state and idempotency to managed shared infrastructure such as PostgreSQL. This
+phase intentionally does not add deployment automation, PostgreSQL, Redis,
+background workers, inbox access, subscriptions, or billing.
 
 ## Current checkpoint
 
-Phase 4 is implemented with manual and optional-AI job application drafting,
-grounded candidate facts, deterministic requirement matching, and validated CV
-attachment preparation. SQLite remains limited to encrypted AI configuration;
-job application history and candidate profiles are not persisted there. Gmail,
-OAuth, subscriptions, billing, scheduling, and real delivery remain
-intentionally absent. `MockEmailSender` is still the only sender.
+Phase 5 is implemented with per-user Google OAuth, encrypted refresh-token
+storage, sender resolution, access-token refresh, real Gmail delivery, and MIME
+CV attachments. Human confirmation remains mandatory. Candidate profiles and
+job history are not persisted in SQLite. `MockEmailSender` remains available for
+tests and offline development; production composition selects Gmail per user.

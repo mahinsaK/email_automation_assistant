@@ -26,11 +26,13 @@ from app.bot.keyboards import (
     JOB_EDIT_RECIPIENT,
     JOB_EDIT_ROLE,
     JOB_EDIT_SUBJECT,
+    JOB_GMAIL_BACK,
     JOB_REGENERATE,
     JOB_TONE_CALLBACKS,
     job_ai_unavailable_keyboard,
     job_draft_method_keyboard,
     job_edit_menu_keyboard,
+    job_gmail_required_keyboard,
     job_preview_actions_keyboard,
     job_tone_keyboard,
 )
@@ -39,10 +41,16 @@ from app.models.job_application import JobApplicationRequest
 from app.services.ai_configuration import AIConfigurationError
 from app.services.attachment import AttachmentValidationError
 from app.services.candidate_profile import CandidateProfileError
+from app.services.gmail.client import GmailClientError
+from app.services.gmail_connection import (
+    GmailAuthorizationError,
+    GmailConnectionError,
+)
 from app.services.job_application_generator import (
     JobApplicationEmailGenerator,
     UserJobApplicationGeneratorResolver,
 )
+from app.services.user_email_sender import UserEmailSenderResolver
 from app.services.validation import (
     MAX_BODY_LENGTH,
     MAX_SUBJECT_LENGTH,
@@ -69,6 +77,7 @@ STALE_MESSAGE = (
 )
 
 Callback = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[int | None]]
+AuthorizationURL = Callable[[int], Awaitable[str | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +166,8 @@ def build_job_application_callbacks(
     workflow: JobApplicationWorkflow,
     *,
     generator_resolver: UserJobApplicationGeneratorResolver | None = None,
+    sender_resolver: UserEmailSenderResolver | None = None,
+    gmail_authorization_url: AuthorizationURL | None = None,
     start_ai_configuration: Callback | None = None,
 ) -> JobApplicationCallbacks:
     """Create job application callbacks with dependencies injected."""
@@ -176,6 +187,30 @@ def build_job_application_callbacks(
         if generator_resolver is None or update.effective_user is None:
             return None
         return await generator_resolver.resolve(update.effective_user.id)
+
+    async def _offer_gmail_connection(
+        update: Update,
+        *,
+        invalid: bool = False,
+    ) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if message is None:
+            return
+        authorization_url = None
+        if user is not None and gmail_authorization_url is not None:
+            authorization_url = await gmail_authorization_url(user.id)
+        text = (
+            "⚠️ Your Gmail connection is no longer valid.\n\n"
+            "Reconnect Gmail before sending. Your application and CV were kept."
+            if invalid
+            else "📧 Gmail is not connected.\n\n"
+            "Connect Gmail before sending. Your application and CV were kept."
+        )
+        await message.reply_text(
+            text,
+            reply_markup=job_gmail_required_keyboard(authorization_url),
+        )
 
     async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data.pop("general_email", None)
@@ -493,7 +528,28 @@ def build_job_application_callbacks(
         if query.message is None or session is None:
             return await _show_stale(query.message)
         if query.data == JOB_CONFIRM:
-            outcome = await workflow.approve(session)
+            sender = None
+            if sender_resolver is not None:
+                user = update.effective_user
+                if user is None:
+                    return await _show_stale(query.message)
+                try:
+                    sender = await sender_resolver.resolve(user.id)
+                except GmailAuthorizationError:
+                    await _offer_gmail_connection(update, invalid=True)
+                    return JobApplicationState.WAITING_FOR_ACTION
+                except (GmailConnectionError, GmailClientError):
+                    LOGGER.warning("Gmail sender could not be resolved")
+                    await query.message.reply_text(
+                        "⚠️ Gmail is temporarily unavailable. "
+                        "Your application and CV were kept."
+                    )
+                    return JobApplicationState.WAITING_FOR_ACTION
+                if sender is None:
+                    await _offer_gmail_connection(update)
+                    return JobApplicationState.WAITING_FOR_ACTION
+
+            outcome = await workflow.approve(session, sender=sender)
             if outcome.duplicate:
                 await query.message.reply_text(
                     "This application is already being processed. It was not "
@@ -504,21 +560,39 @@ def build_job_application_callbacks(
             if outcome.result.success:
                 await query.edit_message_reply_markup(reply_markup=None)
                 context.user_data.pop(WORKFLOW_KEY, None)
-                await query.message.reply_text(
-                    "✅ Job application approved and mock-send completed "
-                    "successfully.\n\n"
-                    f"To:\n{outcome.session.approval.draft.recipient}\n\n"
-                    f"Subject:\n{outcome.session.approval.draft.subject}\n\n"
-                    f"CV prepared:\n{outcome.session.attachment.file_name}\n\n"
-                    "Real Gmail delivery is not enabled yet."
-                )
+                if sender_resolver is None:
+                    success_text = (
+                        "✅ Job application approved and mock-send completed "
+                        "successfully.\n\n"
+                        f"To:\n{outcome.session.approval.draft.recipient}\n\n"
+                        f"Subject:\n{outcome.session.approval.draft.subject}\n\n"
+                        f"CV prepared:\n{outcome.session.attachment.file_name}\n\n"
+                        "Real Gmail delivery is not enabled in this test setup."
+                    )
+                else:
+                    success_text = (
+                        "✅ Job application sent successfully.\n\n"
+                        f"Company:\n{outcome.session.request.company_name}\n\n"
+                        f"To:\n{outcome.session.approval.draft.recipient}\n\n"
+                        f"Role:\n{outcome.session.request.role}\n\n"
+                        f"Attachment:\n{outcome.session.attachment.file_name}"
+                    )
+                await query.message.reply_text(success_text)
                 return ConversationHandler.END
             await query.edit_message_reply_markup(reply_markup=None)
+            if outcome.result.error_code == "gmail_authorization_invalid":
+                await _offer_gmail_connection(update, invalid=True)
+                await _show_preview(query.message, outcome.session)
+                return JobApplicationState.WAITING_FOR_ACTION
             await query.message.reply_text(
-                "⚠️ The mock job application send could not be completed.\n\n"
-                "No real email was delivered. Your draft and CV remain available."
+                "⚠️ The job application could not be sent.\n\n"
+                "Your draft and CV remain available. You can retry or cancel."
             )
             await _show_preview(query.message, outcome.session)
+            return JobApplicationState.WAITING_FOR_ACTION
+        if query.data == JOB_GMAIL_BACK:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await _show_preview(query.message, session)
             return JobApplicationState.WAITING_FOR_ACTION
         if query.data == JOB_REGENERATE:
             if session.draft_mode is DraftMode.MANUAL:

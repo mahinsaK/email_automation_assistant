@@ -230,7 +230,12 @@ class GeneralEmailWorkflow:
         LOGGER.info("Original context edited and email draft regenerated")
         return replace(session, request=request, draft=draft)
 
-    async def approve(self, session: GeneralEmailSession) -> ApprovalOutcome:
+    async def approve(
+        self,
+        session: GeneralEmailSession,
+        *,
+        sender: EmailSender | None = None,
+    ) -> ApprovalOutcome:
         """Claim and send one draft at most once, while retaining failures for retry."""
 
         if (
@@ -254,7 +259,7 @@ class GeneralEmailWorkflow:
         LOGGER.info("Email draft approved by user")
 
         try:
-            result = await self._sender.send(sending_session.draft)
+            result = await (sender or self._sender).send(sending_session.draft)
         except Exception as error:
             LOGGER.exception("Email sender raised an unexpected error")
             result = SendResult(success=False, error=str(error) or "Sender failed")

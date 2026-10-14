@@ -16,6 +16,7 @@ from app.models.job_application import (
 )
 from app.services.attachment import CVAttachmentService
 from app.services.candidate_profile import CandidateProfileService
+from app.services.email_sender import EmailSender
 from app.services.job_application_generator import JobApplicationEmailGenerator
 from app.services.job_requirements import (
     CandidateRequirementMatcher,
@@ -283,9 +284,12 @@ class JobApplicationWorkflow:
     async def approve(
         self,
         session: JobApplicationSession,
+        *,
+        sender: EmailSender | None = None,
     ) -> JobApplicationApprovalOutcome:
         outcome: ApprovalOutcome = await self._approval_workflow.approve(
-            session.approval
+            session.approval,
+            sender=sender,
         )
         LOGGER.info("Job application approved")
         return JobApplicationApprovalOutcome(

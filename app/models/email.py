@@ -32,6 +32,8 @@ class SendResult:
     success: bool
     message_id: str | None = None
     error: str | None = None
+    thread_id: str | None = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

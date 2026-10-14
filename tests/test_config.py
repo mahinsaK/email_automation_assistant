@@ -15,6 +15,14 @@ def test_ai_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("DATABASE_PATH", "data/test.db")
     monkeypatch.setenv("CANDIDATE_PROFILE_PATH", "data/test-profile.json")
     monkeypatch.setenv("CV_FILE_PATH", "attachments/test-cv.pdf")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-client-secret")
+    monkeypatch.setenv(
+        "GOOGLE_OAUTH_REDIRECT_URI",
+        "https://example.com/oauth/google/callback",
+    )
+    monkeypatch.setenv("OAUTH_CALLBACK_HOST", "0.0.0.0")
+    monkeypatch.setenv("OAUTH_CALLBACK_PORT", "9000")
 
     settings = Settings.from_env()
 
@@ -25,6 +33,34 @@ def test_ai_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     assert settings.database_path == "data/test.db"
     assert settings.candidate_profile_path == "data/test-profile.json"
     assert settings.cv_file_path == "attachments/test-cv.pdf"
+    assert settings.google_client_id == "google-client-id"
+    assert settings.google_client_secret == "google-client-secret"
+    assert settings.google_oauth_redirect_uri == (
+        "https://example.com/oauth/google/callback"
+    )
+    assert settings.oauth_callback_host == "0.0.0.0"
+    assert settings.oauth_callback_port == 9000
+
+
+def test_gmail_scope_configuration_rejects_broad_or_missing_send_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-test-token")
+    monkeypatch.setenv(
+        "GMAIL_OAUTH_SCOPES",
+        "https://www.googleapis.com/auth/gmail.readonly",
+    )
+
+    with pytest.raises(ConfigurationError, match="gmail.send"):
+        Settings.from_env()
+
+    monkeypatch.setenv(
+        "GMAIL_OAUTH_SCOPES",
+        "https://www.googleapis.com/auth/gmail.send "
+        "https://www.googleapis.com/auth/gmail.readonly",
+    )
+    with pytest.raises(ConfigurationError, match="may only contain"):
+        Settings.from_env()
 
 
 def test_unknown_ai_provider_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
