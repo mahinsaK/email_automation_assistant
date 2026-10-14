@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import warnings
+from urllib.parse import urlparse
 
 from telegram import Update
 from telegram.warnings import PTBUserWarning
@@ -22,6 +24,12 @@ from app.bot.handlers.ai_configuration_handler import (
 )
 from app.bot.handlers.common_handler import cancel, help_command, start, unknown_command
 from app.bot.handlers.general_email_handler import build_general_email_callbacks
+from app.bot.handlers.gmail_connection_handler import (
+    build_gmail_connection_callbacks,
+)
+from app.bot.handlers.job_application_handler import (
+    build_job_application_callbacks,
+)
 from app.bot.keyboards import (
     ACTION_PATTERN,
     AI_CONFIG_CALLBACK_PATTERN,
@@ -34,25 +42,68 @@ from app.bot.keyboards import (
     DRAFT_METHOD_PATTERN,
     EDIT_PATTERN,
     EMAIL_CALLBACK_PATTERN,
+    GMAIL_CONNECT_CALLBACK_PATTERN,
+    GMAIL_DISCONNECT_CALLBACK_PATTERN,
+    JOB_ACTION_PATTERN,
+    JOB_AI_UNAVAILABLE_PATTERN,
+    JOB_CALLBACK_PATTERN,
+    JOB_DRAFT_METHOD_PATTERN,
+    JOB_EDIT_PATTERN,
+    JOB_TONE_PATTERN,
     TONE_PATTERN,
 )
-from app.bot.states import GeneralEmailState
+from app.bot.states import GeneralEmailState, JobApplicationState
 from app.config import Settings
-from app.models.ai_configuration import AIProviderType
+from app.models.ai_configuration import AIProviderType, ResolvedAIConfiguration
+from app.models.gmail_connection import GmailConnectionInfo
 from app.repositories.ai_configuration import (
     AIConfigurationRepositoryError,
     SQLiteAIConfigurationRepository,
+)
+from app.repositories.gmail_connection import (
+    GmailConnectionRepositoryError,
+    SQLiteGmailConnectionRepository,
 )
 from app.services.ai.credential_validator import OpenAICredentialValidator
 from app.services.ai.openai_provider import OpenAIProvider
 from app.services.ai.provider_factory import AIProviderFactory
 from app.services.ai_configuration import UserAIConfigurationService
 from app.services.ai_email_generator import AIEmailGenerator
+from app.services.attachment import CVAttachmentService
+from app.services.candidate_profile import CandidateProfileService
 from app.services.credential_cipher import CredentialCipherError, FernetCredentialCipher
 from app.services.email_generator import DeterministicEmailGenerator, EmailGenerator
 from app.services.email_sender import MockEmailSender
-from app.services.user_email_generator import ConfiguredUserEmailGeneratorResolver
+from app.services.gmail.callback_server import (
+    GmailOAuthCallbackHandler,
+    OAuthCallbackServer,
+)
+from app.services.gmail.client import GoogleGmailClientFactory
+from app.services.gmail.mime_builder import GmailMIMEBuilder
+from app.services.gmail.oauth_service import (
+    GmailOAuthService,
+    GoogleOAuthLibraryGateway,
+)
+from app.services.gmail.oauth_state import InMemoryOAuthStateStore
+from app.services.gmail_connection import UserGmailConnectionService
+from app.services.job_application_generator import (
+    ConfiguredUserJobApplicationGeneratorResolver,
+)
+from app.services.job_requirements import (
+    CandidateRequirementMatcher,
+    DeterministicJobRequirementExtractor,
+)
+from app.services.user_email_generator import (
+    ConfiguredUserAIProviderResolver,
+    ConfiguredUserEmailGeneratorResolver,
+)
+from app.services.user_email_sender import (
+    ConfiguredUserEmailSenderResolver,
+    UnavailableUserEmailSenderResolver,
+    UserEmailSenderResolver,
+)
 from app.workflows.general_email import GeneralEmailWorkflow
+from app.workflows.job_application import JobApplicationWorkflow
 
 
 LOGGER = logging.getLogger(__name__)
@@ -89,6 +140,7 @@ def build_application(settings: Settings) -> Application:
     """Wire concrete dependencies and return the configured Telegram app."""
 
     repository = SQLiteAIConfigurationRepository(settings.database_path)
+    gmail_repository = SQLiteGmailConnectionRepository(settings.database_path)
     cipher = None
     if settings.credential_encryption_key:
         try:
@@ -99,7 +151,7 @@ def build_application(settings: Settings) -> Application:
             )
     else:
         LOGGER.warning(
-            "Credential encryption key missing; per-user AI configuration disabled"
+            "Credential encryption key missing; per-user AI and Gmail disabled"
         )
 
     configuration_service = UserAIConfigurationService(
@@ -111,27 +163,131 @@ def build_application(settings: Settings) -> Application:
             )
         },
     )
-    application_generator = build_email_generator(settings)
-    generator_resolver = ConfiguredUserEmailGeneratorResolver(
+    provider_factory = AIProviderFactory(
+        model=settings.ai_model,
+        timeout_seconds=settings.ai_timeout_seconds,
+    )
+    application_configuration = (
+        ResolvedAIConfiguration(
+            provider=AIProviderType.OPENAI,
+            api_key=settings.openai_api_key,
+        )
+        if settings.ai_enabled and settings.openai_api_key
+        else None
+    )
+    provider_resolver = ConfiguredUserAIProviderResolver(
         configuration_service=configuration_service,
-        provider_factory=AIProviderFactory(
-            model=settings.ai_model,
-            timeout_seconds=settings.ai_timeout_seconds,
-        ),
-        application_generator=application_generator,
+        provider_factory=provider_factory,
+        application_configuration=application_configuration,
+    )
+    generator_resolver = ConfiguredUserEmailGeneratorResolver(
+        provider_resolver=provider_resolver,
+    )
+    job_generator_resolver = ConfiguredUserJobApplicationGeneratorResolver(
+        provider_resolver=provider_resolver,
     )
     workflow = GeneralEmailWorkflow(
         generator=None,
         sender=MockEmailSender(),
     )
+    job_workflow = JobApplicationWorkflow(
+        profile_service=CandidateProfileService(settings.candidate_profile_path),
+        attachment_service=CVAttachmentService(settings.cv_file_path),
+        requirement_extractor=DeterministicJobRequirementExtractor(),
+        matcher=CandidateRequirementMatcher(),
+        approval_workflow=workflow,
+    )
+    gmail_connection_service = UserGmailConnectionService(
+        repository=gmail_repository,
+        cipher=cipher,
+    )
+    gmail_oauth_service = None
+    sender_resolver: UserEmailSenderResolver = UnavailableUserEmailSenderResolver()
+    callback_server = None
+    application: Application | None = None
+
+    async def notify_gmail_connected(connection: GmailConnectionInfo) -> None:
+        if application is None:
+            raise RuntimeError("Telegram application is unavailable.")
+        await application.bot.send_message(
+            chat_id=connection.telegram_user_id,
+            text=(
+                "✅ Gmail connected successfully.\n\n"
+                f"Account:\n{connection.google_email}\n\n"
+                "You can now send approved emails through this account."
+            ),
+        )
+
+    def telegram_bot_url() -> str | None:
+        if application is None:
+            return None
+        username = application.bot.username
+        if not isinstance(username, str):
+            return None
+        username = username.removeprefix("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+            return None
+        return f"https://t.me/{username}"
+
+    if settings.gmail_oauth_enabled and cipher is not None:
+        assert settings.google_client_id is not None
+        assert settings.google_client_secret is not None
+        gmail_oauth_service = GmailOAuthService(
+            gateway=GoogleOAuthLibraryGateway(
+                client_id=settings.google_client_id,
+                client_secret=settings.google_client_secret,
+                redirect_uri=settings.google_oauth_redirect_uri,
+                scopes=settings.gmail_oauth_scopes,
+            ),
+            state_store=InMemoryOAuthStateStore(
+                ttl_seconds=settings.oauth_state_ttl_seconds
+            ),
+            connection_service=gmail_connection_service,
+        )
+        sender_resolver = ConfiguredUserEmailSenderResolver(
+            connection_service=gmail_connection_service,
+            client_factory=GoogleGmailClientFactory(
+                client_id=settings.google_client_id,
+                client_secret=settings.google_client_secret,
+            ),
+            mime_builder=GmailMIMEBuilder(),
+        )
+        redirect = urlparse(settings.google_oauth_redirect_uri)
+        callback_server = OAuthCallbackServer(
+            host=settings.oauth_callback_host,
+            port=settings.oauth_callback_port,
+            callback_path=redirect.path or "/oauth/google/callback",
+            handler=GmailOAuthCallbackHandler(
+                gmail_oauth_service,
+                on_connected=notify_gmail_connected,
+                return_url=telegram_bot_url,
+            ),
+        )
+    else:
+        LOGGER.warning(
+            "Gmail OAuth unavailable; configure Google credentials and encryption"
+        )
+    gmail_callbacks = build_gmail_connection_callbacks(
+        gmail_connection_service,
+        oauth_service=gmail_oauth_service,
+    )
     ai_callbacks = build_ai_configuration_callbacks(
         configuration_service,
-        application_ai_available=application_generator is not None,
+        application_ai_available=application_configuration is not None,
     )
     callbacks = build_general_email_callbacks(
         workflow,
         generator_resolver=generator_resolver,
+        sender_resolver=sender_resolver,
+        gmail_authorization_url=gmail_callbacks.authorization_url,
         start_ai_configuration=ai_callbacks.begin_from_email,
+    )
+    job_callbacks = build_job_application_callbacks(
+        job_workflow,
+        generator_resolver=job_generator_resolver,
+        sender_resolver=sender_resolver,
+        gmail_authorization_url=gmail_callbacks.authorization_url,
+        start_ai_configuration=ai_callbacks.begin_from_job,
     )
     protect = owner_only(settings.allowed_telegram_user_id)
 
@@ -140,16 +296,53 @@ def build_application(settings: Settings) -> Application:
             await repository.initialize()
         except AIConfigurationRepositoryError:
             LOGGER.error("AI configuration database initialization failed")
+        try:
+            await gmail_repository.initialize()
+        except GmailConnectionRepositoryError:
+            LOGGER.error("Gmail connection database initialization failed")
+        if callback_server is not None:
+            import asyncio
+
+            callback_server.start(asyncio.get_running_loop())
+
+    async def shutdown_services(application: Application) -> None:
+        if callback_server is not None:
+            callback_server.stop()
 
     application = (
         Application.builder()
         .token(settings.telegram_bot_token)
         .post_init(initialize_services)
+        .post_shutdown(shutdown_services)
         .build()
     )
     application.add_handler(CommandHandler("start", protect(start)))
     application.add_handler(CommandHandler("help", protect(help_command)))
     application.add_handler(CommandHandler("ai_status", protect(ai_callbacks.status)))
+    application.add_handler(
+        CommandHandler("connect_gmail", protect(gmail_callbacks.connect))
+    )
+    application.add_handler(
+        CommandHandler("gmail_status", protect(gmail_callbacks.status))
+    )
+    application.add_handler(
+        CommandHandler(
+            "disconnect_gmail",
+            protect(gmail_callbacks.begin_disconnect),
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(gmail_callbacks.handle_connect_action),
+            pattern=GMAIL_CONNECT_CALLBACK_PATTERN,
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(gmail_callbacks.handle_disconnect_action),
+            pattern=GMAIL_DISCONNECT_CALLBACK_PATTERN,
+        )
+    )
     # This conversation intentionally spans multiple text and callback messages,
     # so it must be keyed per user/chat rather than per Telegram message. PTB emits
     # a generic warning for that valid mixed-handler design; suppress only that
@@ -163,6 +356,7 @@ def build_application(settings: Settings) -> Application:
         conversation_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("send", protect(callbacks.begin)),
+                CommandHandler("apply", protect(job_callbacks.begin)),
                 CommandHandler("configure_ai", protect(ai_callbacks.begin)),
                 CommandHandler("remove_ai", protect(ai_callbacks.begin_remove)),
             ],
@@ -281,6 +475,108 @@ def build_application(settings: Settings) -> Application:
                         pattern=AI_REMOVE_PATTERN,
                     )
                 ],
+                JobApplicationState.WAITING_COMPANY_EMAIL: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_company_email),
+                    )
+                ],
+                JobApplicationState.WAITING_COMPANY_NAME: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_company_name),
+                    )
+                ],
+                JobApplicationState.WAITING_ROLE: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_role),
+                    )
+                ],
+                JobApplicationState.WAITING_JOB_DESCRIPTION: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_job_description),
+                    )
+                ],
+                JobApplicationState.WAITING_DRAFT_METHOD: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_draft_method),
+                        pattern=JOB_DRAFT_METHOD_PATTERN,
+                    )
+                ],
+                JobApplicationState.MANUAL_WAITING_SUBJECT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_manual_subject),
+                    )
+                ],
+                JobApplicationState.MANUAL_WAITING_BODY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_manual_body),
+                    )
+                ],
+                JobApplicationState.WAITING_AI_UNAVAILABLE_ACTION: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_ai_unavailable),
+                        pattern=JOB_AI_UNAVAILABLE_PATTERN,
+                    )
+                ],
+                JobApplicationState.WAITING_TONE: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_tone),
+                        pattern=JOB_TONE_PATTERN,
+                    )
+                ],
+                JobApplicationState.WAITING_FOR_ACTION: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_action),
+                        pattern=JOB_ACTION_PATTERN,
+                    )
+                ],
+                JobApplicationState.EDIT_MENU: [
+                    CallbackQueryHandler(
+                        protect(job_callbacks.handle_edit_choice),
+                        pattern=JOB_EDIT_PATTERN,
+                    )
+                ],
+                JobApplicationState.EDIT_RECIPIENT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_recipient),
+                    )
+                ],
+                JobApplicationState.EDIT_COMPANY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_company),
+                    )
+                ],
+                JobApplicationState.EDIT_ROLE: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_role),
+                    )
+                ],
+                JobApplicationState.EDIT_JOB_DESCRIPTION: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_job_description),
+                    )
+                ],
+                JobApplicationState.EDIT_SUBJECT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_subject),
+                    )
+                ],
+                JobApplicationState.EDIT_BODY: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        protect(job_callbacks.receive_edited_body),
+                    )
+                ],
             },
             fallbacks=[
                 CommandHandler("cancel", protect(cancel)),
@@ -295,6 +591,10 @@ def build_application(settings: Settings) -> Application:
                 CallbackQueryHandler(
                     protect(callbacks.handle_invalid_callback),
                     pattern=EMAIL_CALLBACK_PATTERN,
+                ),
+                CallbackQueryHandler(
+                    protect(job_callbacks.handle_invalid_callback),
+                    pattern=JOB_CALLBACK_PATTERN,
                 ),
             ],
             allow_reentry=True,
@@ -318,6 +618,12 @@ def build_application(settings: Settings) -> Application:
         CallbackQueryHandler(
             protect(callbacks.handle_invalid_callback),
             pattern=EMAIL_CALLBACK_PATTERN,
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            protect(job_callbacks.handle_invalid_callback),
+            pattern=JOB_CALLBACK_PATTERN,
         )
     )
     application.add_error_handler(handle_error)
