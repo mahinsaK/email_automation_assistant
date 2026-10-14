@@ -10,15 +10,16 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from cryptography.fernet import Fernet
 
-from app.models.gmail_connection import GoogleOAuthGrant
+from app.models.gmail_connection import GmailConnectionInfo, GoogleOAuthGrant
 from app.repositories.gmail_connection import SQLiteGmailConnectionRepository
 from app.services.credential_cipher import FernetCredentialCipher
-from app.services.gmail.callback_server import GmailOAuthCallbackHandler
+from app.services.gmail.callback_server import GmailOAuthCallbackHandler, _html_page
 from app.services.gmail.oauth_service import (
     GMAIL_SEND_SCOPE,
     GmailOAuthService,
     GoogleOAuthError,
     GoogleOAuthLibraryGateway,
+    _safe_oauth_error_field,
 )
 from app.services.gmail.oauth_state import InMemoryOAuthStateStore, OAuthStateError
 from app.services.gmail_connection import UserGmailConnectionService
@@ -89,6 +90,7 @@ def test_google_authorization_url_contains_redirect_scope_and_state() -> None:
     assert query["state"] == ["opaque-state"]
     assert GMAIL_SEND_SCOPE in query["scope"][0].split()
     assert query["access_type"] == ["offline"]
+    assert "include_granted_scopes" not in query
     assert query["code_challenge"] == [expected_challenge]
     assert query["code_challenge_method"] == ["S256"]
     assert gateway._new_flow(code_verifier=code_verifier).code_verifier == code_verifier
@@ -240,3 +242,53 @@ def test_callback_handler_returns_safe_browser_pages(tmp_path: Path) -> None:
     assert "return to Telegram" in success.message
     assert forged.status_code == 400
     assert "forged" not in forged.message
+
+
+def test_successful_callback_notifies_user_and_links_back_to_bot(
+    tmp_path: Path,
+) -> None:
+    service, _ = make_service(tmp_path)
+    gateway = FakeOAuthGateway(
+        GoogleOAuthGrant("user@gmail.com", "refresh", (GMAIL_SEND_SCOPE,))
+    )
+    oauth = GmailOAuthService(
+        gateway=gateway,
+        state_store=InMemoryOAuthStateStore(),
+        connection_service=service,
+    )
+    notifications: list[GmailConnectionInfo] = []
+
+    async def notify(connection: GmailConnectionInfo) -> None:
+        notifications.append(connection)
+
+    handler = GmailOAuthCallbackHandler(
+        oauth,
+        on_connected=notify,
+        return_url=lambda: "https://t.me/email_assistant_bot",
+    )
+    state = parse_qs(urlparse(oauth.begin(101)).query)["state"][0]
+
+    response = asyncio.run(
+        handler.handle({"state": [state], "code": ["auth-code"]})
+    )
+    page = _html_page(
+        response.title,
+        response.message,
+        action_url=response.action_url,
+    )
+
+    assert response.status_code == 200
+    assert response.action_url == "https://t.me/email_assistant_bot"
+    assert len(notifications) == 1
+    assert notifications[0].telegram_user_id == 101
+    assert notifications[0].google_email == "user@gmail.com"
+    assert "Return to Telegram" in page
+    assert "https://t.me/email_assistant_bot" in page
+
+
+def test_oauth_diagnostic_field_is_bounded_and_single_line() -> None:
+    diagnostic = _safe_oauth_error_field("Missing\ncode verifier." + ("x" * 200))
+
+    assert diagnostic.startswith("Missingcode verifier.")
+    assert "\n" not in diagnostic
+    assert len(diagnostic) == 160

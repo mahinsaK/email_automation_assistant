@@ -56,7 +56,6 @@ class GoogleOAuthLibraryGateway:
         flow = self._new_flow(state=state, code_verifier=code_verifier)
         authorization_url, _ = flow.authorization_url(
             access_type="offline",
-            include_granted_scopes="true",
             prompt="consent",
         )
         return str(authorization_url)
@@ -78,7 +77,13 @@ class GoogleOAuthLibraryGateway:
         except GoogleOAuthError:
             raise
         except Exception as error:
-            LOGGER.warning("Google OAuth code exchange failed: %s", type(error).__name__)
+            LOGGER.warning(
+                "Google OAuth code exchange failed: %s "
+                "(provider_error=%s, description=%s)",
+                type(error).__name__,
+                _safe_oauth_error_field(getattr(error, "error", None)),
+                _safe_oauth_error_field(getattr(error, "description", None)),
+            )
             raise GoogleOAuthError("Google authorization could not be completed.") from error
 
     def _exchange_code_sync(
@@ -196,3 +201,12 @@ class GmailOAuthService:
         )
         LOGGER.info("Gmail OAuth connection completed")
         return info
+
+
+def _safe_oauth_error_field(value: object) -> str:
+    """Render bounded provider metadata without logging requests or credentials."""
+
+    if not isinstance(value, str) or not value:
+        return "unspecified"
+    printable = "".join(character for character in value if character.isprintable())
+    return printable[:160] or "unspecified"

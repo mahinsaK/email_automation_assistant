@@ -82,7 +82,8 @@ GmailEmailSender → MIME builder → Gmail API
 The only Gmail permission requested is `gmail.send`. The OAuth request also
 uses the standard `openid` and `userinfo.email` identity scopes so the bot can
 show which account is connected. It does not request mailbox read, modify,
-delete, label, or settings permissions.
+delete, label, or settings permissions. The authorization request does not
+merge permissions from older grants belonging to the same Google OAuth client.
 
 General messages are plain-text MIME emails. Job applications use the same
 builder, which creates a multipart message and includes the configured CV with
@@ -646,8 +647,11 @@ OAUTHLIB_INSECURE_TRANSPORT=1
 
 Never enable insecure transport for a deployed HTTPS callback. Google requires
 the redirect URI to match the OAuth client configuration exactly. The callback
-page intentionally shows only success/failure and directs the user back to
-Telegram; it never displays codes or tokens.
+page intentionally shows only success/failure and provides a button back to the
+running Telegram bot; it never displays codes or tokens. After a successful
+connection, the bot also sends the originating user a confirmation containing
+only the connected account address. A notification failure does not undo the
+saved Gmail connection.
 
 Official references:
 

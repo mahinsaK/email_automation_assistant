@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from urllib.parse import urlparse
 
@@ -54,6 +55,7 @@ from app.bot.keyboards import (
 from app.bot.states import GeneralEmailState, JobApplicationState
 from app.config import Settings
 from app.models.ai_configuration import AIProviderType, ResolvedAIConfiguration
+from app.models.gmail_connection import GmailConnectionInfo
 from app.repositories.ai_configuration import (
     AIConfigurationRepositoryError,
     SQLiteAIConfigurationRepository,
@@ -202,6 +204,31 @@ def build_application(settings: Settings) -> Application:
     gmail_oauth_service = None
     sender_resolver: UserEmailSenderResolver = UnavailableUserEmailSenderResolver()
     callback_server = None
+    application: Application | None = None
+
+    async def notify_gmail_connected(connection: GmailConnectionInfo) -> None:
+        if application is None:
+            raise RuntimeError("Telegram application is unavailable.")
+        await application.bot.send_message(
+            chat_id=connection.telegram_user_id,
+            text=(
+                "✅ Gmail connected successfully.\n\n"
+                f"Account:\n{connection.google_email}\n\n"
+                "You can now send approved emails through this account."
+            ),
+        )
+
+    def telegram_bot_url() -> str | None:
+        if application is None:
+            return None
+        username = application.bot.username
+        if not isinstance(username, str):
+            return None
+        username = username.removeprefix("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+            return None
+        return f"https://t.me/{username}"
+
     if settings.gmail_oauth_enabled and cipher is not None:
         assert settings.google_client_id is not None
         assert settings.google_client_secret is not None
@@ -230,7 +257,11 @@ def build_application(settings: Settings) -> Application:
             host=settings.oauth_callback_host,
             port=settings.oauth_callback_port,
             callback_path=redirect.path or "/oauth/google/callback",
-            handler=GmailOAuthCallbackHandler(gmail_oauth_service),
+            handler=GmailOAuthCallbackHandler(
+                gmail_oauth_service,
+                on_connected=notify_gmail_connected,
+                return_url=telegram_bot_url,
+            ),
         )
     else:
         LOGGER.warning(
